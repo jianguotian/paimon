@@ -150,4 +150,60 @@ public class FormatTableITCase extends RESTCatalogITCaseBase {
 
         sql("Drop TABLE %s", tableName);
     }
+
+    @Test
+    public void testPartitionPathHiveStyleStillDelegatesToFilesystem() {
+        // Default (partition-path-only-value not set / false) must still keep the legacy
+        // delegation to Flink's filesystem connector with Hive-style `key=value` partitions.
+        String tableName = "format_table_hive_partition_default";
+        sql(
+                "CREATE TABLE %s (a INT, b STRING, dt STRING) "
+                        + "PARTITIONED BY (dt) "
+                        + "WITH ('file.format'='csv', 'type'='format-table')",
+                tableName);
+
+        sql("INSERT INTO %s PARTITION (dt='2026-06-04') VALUES (1, 'x'), (2, 'y')", tableName);
+        sql("INSERT INTO %s PARTITION (dt='2026-06-05') VALUES (3, 'z')", tableName);
+
+        assertThat(sql("SELECT a, b, dt FROM %s", tableName))
+                .containsExactlyInAnyOrder(
+                        Row.of(1, "x", "2026-06-04"),
+                        Row.of(2, "y", "2026-06-04"),
+                        Row.of(3, "z", "2026-06-05"));
+
+        sql("Drop TABLE %s", tableName);
+    }
+
+    @Test
+    public void testPartitionPathOnlyValue() {
+        // SELECT used to return empty because FormatCatalogTable delegated to Flink's filesystem
+        // connector (connector=filesystem), whose partition discovery only matches Hive-style
+        // `key=value` directories. With format-table.partition-path-only-value=true the layout is
+        // bare `value/...`, so the filesystem connector silently produced 0 splits. We now route
+        // through paimon's own scan path (FormatReadBuilder + FormatTableScan) which honors the
+        // option.
+        String tableName = "format_table_partition_only_value";
+        sql(
+                "CREATE TABLE %s (a INT, b STRING, dt STRING, hh STRING) "
+                        + "PARTITIONED BY (dt, hh) "
+                        + "WITH ("
+                        + "'file.format'='csv', "
+                        + "'type'='format-table', "
+                        + "'format-table.partition-path-only-value'='true'"
+                        + ")",
+                tableName);
+
+        sql(
+                "INSERT INTO %s PARTITION (dt='2026-06-04', hh='17') VALUES (1, 'x'), (2, 'y')",
+                tableName);
+        sql("INSERT INTO %s PARTITION (dt='2026-06-04', hh='18') VALUES (3, 'z')", tableName);
+
+        assertThat(sql("SELECT a, b, dt, hh FROM %s", tableName))
+                .containsExactlyInAnyOrder(
+                        Row.of(1, "x", "2026-06-04", "17"),
+                        Row.of(2, "y", "2026-06-04", "17"),
+                        Row.of(3, "z", "2026-06-04", "18"));
+
+        sql("Drop TABLE %s", tableName);
+    }
 }

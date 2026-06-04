@@ -18,6 +18,8 @@
 
 package org.apache.paimon.flink;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.FormatTable;
 
 import org.apache.flink.table.api.Schema;
@@ -34,6 +36,7 @@ import static org.apache.flink.connector.file.table.FileSystemConnectorOptions.P
 import static org.apache.flink.table.factories.FactoryUtil.CONNECTOR;
 import static org.apache.flink.table.factories.FactoryUtil.FORMAT;
 import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDataType;
+import static org.apache.paimon.flink.FlinkCatalogFactory.IDENTIFIER;
 import static org.apache.paimon.flink.LogicalTypeConversion.toLogicalType;
 
 /** A {@link CatalogTable} to represent format table. */
@@ -88,6 +91,15 @@ public class FormatCatalogTable implements CatalogTable {
             cachedOptions = new HashMap<>();
             String format = table.format().name().toLowerCase();
             Map<String, String> options = table.options();
+            // Flink's filesystem connector only discovers Hive-style key=value partition
+            // directories. For bare-value paths the paimon connector reads them directly,
+            // so FormatReadBuilder honors FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH on read.
+            if (Options.fromMap(options)
+                    .get(CoreOptions.FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH)) {
+                cachedOptions.putAll(options);
+                cachedOptions.put(CONNECTOR.key(), IDENTIFIER);
+                return cachedOptions;
+            }
             options.forEach(
                     (k, v) -> {
                         if (k.startsWith(format + ".")) {

@@ -95,6 +95,10 @@ public abstract class AbstractFlinkTableFactory
         }
         if (origin instanceof SystemCatalogTable) {
             return new SystemTableSource(table, unbounded, context.getObjectIdentifier());
+        } else if (table instanceof FormatTable) {
+            // FormatTable is always bounded; SystemTableSource is a generic ReadBuilder
+            // wrapper that honors FormatTable's own scan, including bare-value partitions.
+            return new SystemTableSource(table, false, context.getObjectIdentifier());
         } else {
             return new DataTableSource(context.getObjectIdentifier(), table, unbounded, context);
         }
