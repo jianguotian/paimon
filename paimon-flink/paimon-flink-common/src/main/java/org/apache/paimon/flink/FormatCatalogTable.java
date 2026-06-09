@@ -96,7 +96,8 @@ public class FormatCatalogTable implements CatalogTable {
             // so FormatReadBuilder honors FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH on read.
             if (Options.fromMap(options)
                     .get(CoreOptions.FORMAT_TABLE_PARTITION_ONLY_VALUE_IN_PATH)) {
-                cachedOptions.putAll(options);
+                // Only the connector key is needed: paimon reads path/format/partitions
+                // from table(), not from this map. Don't add filesystem options below.
                 cachedOptions.put(CONNECTOR.key(), IDENTIFIER);
                 return cachedOptions;
             }
