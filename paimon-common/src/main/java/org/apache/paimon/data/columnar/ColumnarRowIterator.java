@@ -23,6 +23,7 @@ import org.apache.paimon.data.PartitionInfo;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.SpecialFields;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.LongIterator;
 import org.apache.paimon.utils.RecyclableIterator;
 import org.apache.paimon.utils.VectorMappingUtils;
@@ -41,8 +42,9 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
         implements BatchColumnarRowIterator {
 
     protected final Path filePath;
-    protected final ColumnarRow row;
+    @Nullable protected final ColumnarRow row;
     protected final Runnable recycler;
+    private final int batchRowCount;
 
     protected int num;
     protected int index;
@@ -51,19 +53,32 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     protected LongIterator positionIterator;
 
     public ColumnarRowIterator(Path filePath, ColumnarRow row, @Nullable Runnable recycler) {
+        this(filePath, row, row.batch().getNumRows(), recycler);
+    }
+
+    protected ColumnarRowIterator(Path filePath, int batchRowCount, @Nullable Runnable recycler) {
+        this(filePath, null, batchRowCount, recycler);
+    }
+
+    private ColumnarRowIterator(
+            Path filePath,
+            @Nullable ColumnarRow row,
+            int batchRowCount,
+            @Nullable Runnable recycler) {
         super(recycler);
         this.filePath = filePath;
         this.row = row;
         this.recycler = recycler;
+        this.batchRowCount = batchRowCount;
     }
 
     public void reset(long nextFilePos) {
-        reset(LongIterator.fromRange(nextFilePos, nextFilePos + row.batch().getNumRows()));
+        reset(LongIterator.fromRange(nextFilePos, nextFilePos + batchRowCount));
     }
 
     public void reset(LongIterator positions) {
         this.positionIterator = positions;
-        this.num = row.batch().getNumRows();
+        this.num = batchRowCount;
         this.index = 0;
         this.returnedPositionIndex = 0;
         this.returnedPosition = -1;
@@ -73,8 +88,9 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     @Override
     public InternalRow next() {
         if (index < num) {
-            row.setRowId(index++);
-            return row;
+            ColumnarRow currentRow = row();
+            currentRow.setRowId(index++);
+            return currentRow;
         } else {
             return null;
         }
@@ -100,7 +116,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
 
     @Override
     public VectorizedColumnBatch batch() {
-        return row.batch();
+        return row().batch();
     }
 
     @Override
@@ -108,7 +124,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
         // We should call copy only when the iterator is at the beginning of the file.
         checkArgument(returnedPositionIndex == 0, "copy() should not be called after next()");
         ColumnarRowIterator newIterator =
-                new ColumnarRowIterator(filePath, row.copy(vectors), recycler);
+                new ColumnarRowIterator(filePath, row().copy(vectors), recycler);
         newIterator.reset(positionIterator);
         return newIterator;
     }
@@ -116,7 +132,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     public ColumnarRowIterator mapping(
             @Nullable PartitionInfo partitionInfo, @Nullable int[] indexMapping) {
         if (partitionInfo != null || indexMapping != null) {
-            VectorizedColumnBatch vectorizedColumnBatch = row.batch();
+            VectorizedColumnBatch vectorizedColumnBatch = row().batch();
             ColumnVector[] vectors = vectorizedColumnBatch.columns;
             if (partitionInfo != null) {
                 vectors = VectorMappingUtils.createPartitionMappedVectors(partitionInfo, vectors);
@@ -129,9 +145,23 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
         return this;
     }
 
+    /**
+     * Maps this batch to the final output row type.
+     *
+     * <p>Subclasses which can preserve a native batch representation may override this overload to
+     * use the final row names and types. The default implementation keeps the existing mapping
+     * behavior.
+     */
+    public ColumnarRowIterator mapping(
+            RowType outputRowType,
+            @Nullable PartitionInfo partitionInfo,
+            @Nullable int[] indexMapping) {
+        return mapping(partitionInfo, indexMapping);
+    }
+
     public ColumnarRowIterator assignRowTracking(
             Long firstRowId, Long snapshotId, Map<String, Integer> meta) {
-        VectorizedColumnBatch vectorizedColumnBatch = row.batch();
+        VectorizedColumnBatch vectorizedColumnBatch = row().batch();
         ColumnVector[] vectors = vectorizedColumnBatch.columns;
 
         if (meta.containsKey(SpecialFields.ROW_ID.name())) {
@@ -178,5 +208,12 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
 
         copy(vectors);
         return this;
+    }
+
+    protected ColumnarRow row() {
+        if (row == null) {
+            throw new IllegalStateException("Columnar row has not been initialized.");
+        }
+        return row;
     }
 }
