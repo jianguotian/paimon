@@ -41,6 +41,8 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
 public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
         implements BatchColumnarRowIterator {
 
+    private static final int DYNAMIC_BATCH_ROW_COUNT = -1;
+
     protected final Path filePath;
     @Nullable protected final ColumnarRow row;
     protected final Runnable recycler;
@@ -53,7 +55,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     protected LongIterator positionIterator;
 
     public ColumnarRowIterator(Path filePath, ColumnarRow row, @Nullable Runnable recycler) {
-        this(filePath, row, row.batch().getNumRows(), recycler);
+        this(filePath, row, DYNAMIC_BATCH_ROW_COUNT, recycler);
     }
 
     protected ColumnarRowIterator(Path filePath, int batchRowCount, @Nullable Runnable recycler) {
@@ -73,12 +75,13 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     }
 
     public void reset(long nextFilePos) {
-        reset(LongIterator.fromRange(nextFilePos, nextFilePos + batchRowCount));
+        int rowCount = batchRowCount();
+        reset(LongIterator.fromRange(nextFilePos, nextFilePos + rowCount));
     }
 
     public void reset(LongIterator positions) {
         this.positionIterator = positions;
-        this.num = batchRowCount;
+        this.num = batchRowCount();
         this.index = 0;
         this.returnedPositionIndex = 0;
         this.returnedPosition = -1;
@@ -215,5 +218,11 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
             throw new IllegalStateException("Columnar row has not been initialized.");
         }
         return row;
+    }
+
+    private int batchRowCount() {
+        return batchRowCount == DYNAMIC_BATCH_ROW_COUNT
+                ? row().batch().getNumRows()
+                : batchRowCount;
     }
 }
