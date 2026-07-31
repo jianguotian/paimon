@@ -19,6 +19,7 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
+import org.apache.paimon.arrow.reader.ArrowBatchReader;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.BundleFormatWriter;
@@ -32,8 +33,11 @@ import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
@@ -46,10 +50,22 @@ import java.util.Map;
 /** Mosaic records writer. */
 public class MosaicRecordsWriter implements BundleFormatWriter {
 
+    private static final Logger LOG = LoggerFactory.getLogger(MosaicRecordsWriter.class);
+
     private final ArrowFormatWriter arrowFormatWriter;
     private final MosaicWriter nativeWriter;
     private final BufferAllocator allocator;
     private final List<String> statsColumnNames;
+    private final RowType rowType;
+    private final Schema arrowSchema;
+    @Nullable private RowType verifiedDirectRowType;
+    @Nullable private Schema verifiedDirectSchema;
+    private long directArrowRows;
+    private long allocatorCompatibilityFallbackRows;
+    private long projectedArrowFallbackRows;
+    private long genericBundleRows;
+    private long directSchemaValidations;
+    private boolean independentAllocatorDirectWriteUnsupported;
     @Nullable private MosaicWriterMetadata metadata;
 
     public MosaicRecordsWriter(
@@ -77,6 +93,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             BufferAllocator allocator,
             NativeWriterFactory nativeWriterFactory) {
         this.statsColumnNames = statsColumnNames;
+        this.rowType = rowType;
         this.allocator = allocator;
 
         int writeBatchSize = formatContext.writeBatchSize();
@@ -96,13 +113,15 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
 
         ArrowFormatWriter createdArrowWriter = null;
         MosaicWriter createdNativeWriter = null;
+        Schema createdArrowSchema;
         try {
             createdArrowWriter =
                     ArrowFormatWriter.forBorrowedAllocator(
                             rowType, writeBatchSize, true, allocator, writeBatchMemory);
-            Schema arrowSchema = createdArrowWriter.getVectorSchemaRoot().getSchema();
+            createdArrowSchema = createdArrowWriter.getVectorSchemaRoot().getSchema();
             createdNativeWriter =
-                    nativeWriterFactory.create(outputStream, arrowSchema, options, allocator);
+                    nativeWriterFactory.create(
+                            outputStream, createdArrowSchema, options, allocator);
         } catch (Throwable t) {
             closeOnConstructionFailure(t, createdNativeWriter, createdArrowWriter, allocator);
             throw rethrowUnchecked(t);
@@ -110,6 +129,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
 
         this.arrowFormatWriter = createdArrowWriter;
         this.nativeWriter = createdNativeWriter;
+        this.arrowSchema = createdArrowSchema;
     }
 
     @Override
@@ -125,12 +145,56 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     @Override
     public void writeBundle(BundleRecords bundleRecords) {
         if (bundleRecords instanceof ArrowBundleRecords) {
-            flush();
-            nativeWriter.write(((ArrowBundleRecords) bundleRecords).getVectorSchemaRoot());
-        } else {
-            for (InternalRow row : bundleRecords) {
-                addElement(row);
+            ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
+            VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
+            RowType bundleRowType = arrowBundle.getRowType();
+            Schema bundleSchema = root.getSchema();
+            boolean trustedMosaicBundle = arrowBundle instanceof MosaicArrowBundleRecords;
+            boolean directCompatible =
+                    trustedMosaicBundle
+                            && bundleRowType == verifiedDirectRowType
+                            && bundleSchema.equals(verifiedDirectSchema);
+            if (!directCompatible) {
+                directSchemaValidations++;
+                directCompatible =
+                        MosaicArrowSchemaCompatibility.matchesRowType(rowType, bundleRowType)
+                                && MosaicArrowSchemaCompatibility.matchesWriter(
+                                        arrowSchema, bundleSchema);
+                if (directCompatible && trustedMosaicBundle) {
+                    verifiedDirectRowType = bundleRowType;
+                    verifiedDirectSchema = bundleSchema;
+                }
             }
+            if (directCompatible) {
+                if (tryDirectWrite(root, arrowBundle.rowCount())) {
+                    return;
+                }
+                writeArrowRows(root);
+                allocatorCompatibilityFallbackRows += arrowBundle.rowCount();
+                return;
+            }
+            if (MosaicArrowSchemaCompatibility.matchesRowTypeByName(rowType, bundleRowType)
+                    && root.getSchema().getFields().size() == rowType.getFieldCount()
+                    && MosaicArrowSchemaCompatibility.matchesProjection(
+                            rowType, root.getSchema())) {
+                writeArrowRows(root);
+                projectedArrowFallbackRows += arrowBundle.rowCount();
+                return;
+            }
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Arrow bundle schema is incompatible with Mosaic writer schema. "
+                                    + "Expected row type: %s, actual row type: %s, "
+                                    + "Expected fields: %s, actual fields: %s.",
+                            rowType,
+                            bundleRowType,
+                            arrowSchema.getFields(),
+                            root.getSchema().getFields()));
+        }
+
+        genericBundleRows += bundleRecords.rowCount();
+        for (InternalRow row : bundleRecords) {
+            addElement(row);
         }
     }
 
@@ -176,6 +240,22 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             throwable = addSuppressed(throwable, t);
         }
 
+        if (directArrowRows > 0
+                || allocatorCompatibilityFallbackRows > 0
+                || projectedArrowFallbackRows > 0
+                || genericBundleRows > 0) {
+            LOG.info(
+                    "Mosaic bundle write paths: directArrowRows={}, "
+                            + "allocatorCompatibilityFallbackRows={}, "
+                            + "projectedArrowFallbackRows={}, genericBundleRows={}, "
+                            + "directSchemaValidations={}",
+                    directArrowRows,
+                    allocatorCompatibilityFallbackRows,
+                    projectedArrowFallbackRows,
+                    genericBundleRows,
+                    directSchemaValidations);
+        }
+
         if (throwable != null) {
             rethrow(throwable);
         }
@@ -196,12 +276,63 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         this.metadata = new MosaicWriterMetadata(numRowGroups, allStats, statsColumnNames);
     }
 
-    private void flush() {
-        arrowFormatWriter.flush();
-        if (!arrowFormatWriter.empty()) {
-            VectorSchemaRoot vsr = arrowFormatWriter.getVectorSchemaRoot();
-            nativeWriter.write(vsr);
+    private boolean tryDirectWrite(VectorSchemaRoot root, long rowCount) {
+        boolean sharesWriterRoot = sharesWriterAllocatorRoot(root);
+        if (!sharesWriterRoot && independentAllocatorDirectWriteUnsupported) {
+            return false;
         }
+
+        flush();
+        try {
+            nativeWriter.write(root);
+            directArrowRows += rowCount;
+            return true;
+        } catch (IllegalArgumentException e) {
+            if (sharesWriterRoot || !isAllocatorRootMismatch(e)) {
+                throw e;
+            }
+            independentAllocatorDirectWriteUnsupported = true;
+            return false;
+        }
+    }
+
+    private boolean sharesWriterAllocatorRoot(VectorSchemaRoot root) {
+        BufferAllocator writerRoot = allocator.getRoot();
+        for (FieldVector vector : root.getFieldVectors()) {
+            if (vector.getAllocator().getRoot() != writerRoot) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isAllocatorRootMismatch(Throwable throwable) {
+        while (throwable != null) {
+            String message = throwable.getMessage();
+            if (message != null
+                    && message.contains(
+                            "A buffer can only be associated between two allocators "
+                                    + "that share the same root")) {
+                return true;
+            }
+            throwable = throwable.getCause();
+        }
+        return false;
+    }
+
+    private void writeArrowRows(VectorSchemaRoot root) {
+        for (InternalRow row : new ArrowBatchReader(rowType, true).readBatch(root)) {
+            addElement(row);
+        }
+    }
+
+    private void flush() {
+        if (arrowFormatWriter.empty()) {
+            return;
+        }
+        arrowFormatWriter.flush();
+        VectorSchemaRoot vsr = arrowFormatWriter.getVectorSchemaRoot();
+        nativeWriter.write(vsr);
         arrowFormatWriter.reset();
     }
 
