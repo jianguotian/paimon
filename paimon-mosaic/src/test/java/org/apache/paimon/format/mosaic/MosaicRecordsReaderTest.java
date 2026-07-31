@@ -313,11 +313,11 @@ class MosaicRecordsReaderTest {
         CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
         MosaicReader reader = mock(MosaicReader.class);
         VectorSchemaRoot firstRoot = intRoot(allocator, 10);
-        VectorSchemaRoot secondRoot = intRoot(allocator, 20);
+        VectorSchemaRoot secondRoot = intRoot(allocator, 20, 30);
         when(reader.getSchema()).thenReturn(firstRoot.getSchema());
         when(reader.numRowGroups()).thenReturn(2);
         when(reader.rowGroupNumRows(0)).thenReturn(1);
-        when(reader.rowGroupNumRows(1)).thenReturn(1);
+        when(reader.rowGroupNumRows(1)).thenReturn(2);
         when(reader.readRowGroup(0, allocator)).thenReturn(firstRoot);
         when(reader.readRowGroup(1, allocator)).thenReturn(secondRoot);
 
@@ -335,8 +335,12 @@ class MosaicRecordsReaderTest {
                         ((ArrowVectorizedRecordIterator) second)
                                 .arrowBundle()
                                 .getVectorSchemaRoot());
+        assertThat(((VectorizedRecordIterator) first).batch().getNumRows()).isEqualTo(1);
+        assertThat(((VectorizedRecordIterator) second).batch().getNumRows()).isEqualTo(2);
         assertThat(first.next().getInt(0)).isEqualTo(10);
         assertThat(second.next().getInt(0)).isEqualTo(20);
+        assertThat(second.next().getInt(0)).isEqualTo(30);
+        assertThat(second.next()).isNull();
         assertThat(firstRoot.getVector(0).getObject(0)).isEqualTo(10);
 
         second.releaseBatch();
@@ -618,6 +622,82 @@ class MosaicRecordsReaderTest {
 
         assertThat(mappedRecords).isInstanceOf(VectorizedRecordIterator.class);
         assertThat(mappedRecords).isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+        mappedRecords.releaseBatch();
+        dataFileReader.close();
+        assertThat(allocator.getAllocatedMemory()).isZero();
+    }
+
+    @Test
+    void testLargePartitionExpansionPreallocatesWithoutTransientOom() throws IOException {
+        CloseCountingSeekableInputStream inputStream = new CloseCountingSeekableInputStream();
+        MosaicInputFileAdapter inputFileAdapter = createInputFileAdapter(inputStream);
+        CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+        MosaicReader reader = mock(MosaicReader.class);
+        RowType physicalType = RowType.builder().field("f0", DataTypes.INT()).build();
+        RowType dataType =
+                RowType.builder()
+                        .field("f0", DataTypes.INT())
+                        .field("partition_value", DataTypes.STRING())
+                        .build();
+        RowType partitionType =
+                RowType.builder().field("partition_value", DataTypes.STRING()).build();
+        VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(physicalType, allocator);
+        IntVector f0Vector = (IntVector) root.getVector(0);
+        f0Vector.allocateNew(1);
+        f0Vector.setSafe(0, 10);
+        f0Vector.setValueCount(1);
+        root.setRowCount(33_000);
+        when(reader.getSchema()).thenReturn(root.getSchema());
+        when(reader.numRowGroups()).thenReturn(1);
+        when(reader.rowGroupNumRows(0)).thenReturn(33_000);
+        when(reader.readRowGroup(0, allocator)).thenReturn(root);
+
+        String largePartitionValue = String.join("", Collections.nCopies(1024, "x"));
+        BinaryRow partition =
+                new InternalRowSerializer(partitionType)
+                        .toBinaryRow(GenericRow.of(BinaryString.fromString(largePartitionValue)))
+                        .copy();
+        PartitionInfo partitionInfo =
+                PartitionUtils.create(
+                        PartitionUtils.getPartitionMapping(
+                                Collections.singletonList("partition_value"),
+                                dataType.getFields(),
+                                partitionType),
+                        partition);
+        Path filePath = new Path("file:/tmp/mosaic-reader-test");
+        MosaicRecordsReader recordsReader =
+                new MosaicRecordsReader(
+                        inputFileAdapter,
+                        0,
+                        physicalType,
+                        physicalType,
+                        null,
+                        filePath,
+                        allocator,
+                        (inputFile, fileSize, bufferAllocator) -> reader);
+        DataFileRecordReader dataFileReader =
+                new DataFileRecordReader(
+                        dataType,
+                        recordsReader,
+                        false,
+                        false,
+                        null,
+                        null,
+                        partitionInfo,
+                        false,
+                        null,
+                        0,
+                        Collections.emptyMap(),
+                        null,
+                        filePath);
+
+        FileRecordIterator<InternalRow> mappedRecords = dataFileReader.readBatch();
+
+        assertThat(mappedRecords).isInstanceOf(ArrowVectorizedRecordIterator.class);
+        VectorSchemaRoot mappedRoot =
+                ((ArrowVectorizedRecordIterator) mappedRecords).arrowBundle().getVectorSchemaRoot();
+        assertThat(mappedRoot.getVector(1).getObject(32_999).toString())
+                .isEqualTo(largePartitionValue);
         mappedRecords.releaseBatch();
         dataFileReader.close();
         assertThat(allocator.getAllocatedMemory()).isZero();
@@ -972,13 +1052,15 @@ class MosaicRecordsReaderTest {
         return DataTypes.ROW(DataTypes.INT());
     }
 
-    private static VectorSchemaRoot intRoot(RootAllocator allocator, int value) {
+    private static VectorSchemaRoot intRoot(RootAllocator allocator, int... values) {
         VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(rowType(), allocator);
         IntVector vector = (IntVector) root.getVector(0);
-        vector.allocateNew(1);
-        vector.setSafe(0, value);
-        vector.setValueCount(1);
-        root.setRowCount(1);
+        vector.allocateNew(values.length);
+        for (int i = 0; i < values.length; i++) {
+            vector.setSafe(i, values[i]);
+        }
+        vector.setValueCount(values.length);
+        root.setRowCount(values.length);
         return root;
     }
 

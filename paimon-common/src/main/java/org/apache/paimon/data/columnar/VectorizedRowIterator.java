@@ -32,20 +32,16 @@ public class VectorizedRowIterator extends ColumnarRowIterator implements Vector
         super(filePath, row, recycler);
     }
 
-    protected VectorizedRowIterator(Path filePath, int batchRowCount, @Nullable Runnable recycler) {
-        super(filePath, batchRowCount, recycler);
-    }
-
     @Override
     public VectorizedColumnBatch batch() {
-        return row().batch();
+        return row.batch();
     }
 
     @Override
     public VectorizedRowIterator copy(ColumnVector[] vectors) {
         checkArgument(returnedPositionIndex == 0, "copy() should not be called after next()");
         VectorizedRowIterator newIterator =
-                new VectorizedRowIterator(filePath, row().copy(vectors), recycler);
+                new VectorizedRowIterator(filePath, row.copy(vectors), recycler);
         newIterator.reset(positionIterator);
         return newIterator;
     }

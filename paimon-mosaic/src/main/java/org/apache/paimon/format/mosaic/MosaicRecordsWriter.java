@@ -33,6 +33,7 @@ import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
@@ -57,11 +58,14 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     private final List<String> statsColumnNames;
     private final RowType rowType;
     private final Schema arrowSchema;
-    @Nullable private Object verifiedDirectSchemaIdentity;
+    @Nullable private RowType verifiedDirectRowType;
+    @Nullable private Schema verifiedDirectSchema;
     private long directArrowRows;
+    private long allocatorCompatibilityFallbackRows;
     private long projectedArrowFallbackRows;
     private long genericBundleRows;
     private long directSchemaValidations;
+    private boolean independentAllocatorDirectWriteUnsupported;
     @Nullable private MosaicWriterMetadata metadata;
 
     public MosaicRecordsWriter(
@@ -144,35 +148,36 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
             VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
             RowType bundleRowType = arrowBundle.getRowType();
-            Object schemaIdentity =
-                    arrowBundle instanceof MosaicArrowBundleRecords
-                            ? ((MosaicArrowBundleRecords) arrowBundle).schemaIdentity()
-                            : null;
+            Schema bundleSchema = root.getSchema();
+            boolean trustedMosaicBundle = arrowBundle instanceof MosaicArrowBundleRecords;
             boolean directCompatible =
-                    schemaIdentity != null && schemaIdentity == verifiedDirectSchemaIdentity;
+                    trustedMosaicBundle
+                            && bundleRowType == verifiedDirectRowType
+                            && bundleSchema.equals(verifiedDirectSchema);
             if (!directCompatible) {
                 directSchemaValidations++;
                 directCompatible =
                         MosaicArrowSchemaCompatibility.matchesRowType(rowType, bundleRowType)
                                 && MosaicArrowSchemaCompatibility.matchesWriter(
-                                        arrowSchema, root.getSchema());
-                if (directCompatible && schemaIdentity != null) {
-                    verifiedDirectSchemaIdentity = schemaIdentity;
+                                        arrowSchema, bundleSchema);
+                if (directCompatible && trustedMosaicBundle) {
+                    verifiedDirectRowType = bundleRowType;
+                    verifiedDirectSchema = bundleSchema;
                 }
             }
             if (directCompatible) {
-                flush();
-                nativeWriter.write(root);
-                directArrowRows += arrowBundle.rowCount();
+                if (tryDirectWrite(root, arrowBundle.rowCount())) {
+                    return;
+                }
+                writeArrowRows(root);
+                allocatorCompatibilityFallbackRows += arrowBundle.rowCount();
                 return;
             }
             if (MosaicArrowSchemaCompatibility.matchesRowTypeByName(rowType, bundleRowType)
                     && root.getSchema().getFields().size() == rowType.getFieldCount()
                     && MosaicArrowSchemaCompatibility.matchesProjection(
                             rowType, root.getSchema())) {
-                for (InternalRow row : new ArrowBatchReader(rowType, true).readBatch(root)) {
-                    addElement(row);
-                }
+                writeArrowRows(root);
                 projectedArrowFallbackRows += arrowBundle.rowCount();
                 return;
             }
@@ -235,12 +240,17 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             throwable = addSuppressed(throwable, t);
         }
 
-        if (directArrowRows > 0 || projectedArrowFallbackRows > 0 || genericBundleRows > 0) {
+        if (directArrowRows > 0
+                || allocatorCompatibilityFallbackRows > 0
+                || projectedArrowFallbackRows > 0
+                || genericBundleRows > 0) {
             LOG.info(
                     "Mosaic bundle write paths: directArrowRows={}, "
+                            + "allocatorCompatibilityFallbackRows={}, "
                             + "projectedArrowFallbackRows={}, genericBundleRows={}, "
                             + "directSchemaValidations={}",
                     directArrowRows,
+                    allocatorCompatibilityFallbackRows,
                     projectedArrowFallbackRows,
                     genericBundleRows,
                     directSchemaValidations);
@@ -264,6 +274,56 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             allStats.add(nativeWriter.getRowGroupStatistics(i));
         }
         this.metadata = new MosaicWriterMetadata(numRowGroups, allStats, statsColumnNames);
+    }
+
+    private boolean tryDirectWrite(VectorSchemaRoot root, long rowCount) {
+        boolean sharesWriterRoot = sharesWriterAllocatorRoot(root);
+        if (!sharesWriterRoot && independentAllocatorDirectWriteUnsupported) {
+            return false;
+        }
+
+        flush();
+        try {
+            nativeWriter.write(root);
+            directArrowRows += rowCount;
+            return true;
+        } catch (IllegalArgumentException e) {
+            if (sharesWriterRoot || !isAllocatorRootMismatch(e)) {
+                throw e;
+            }
+            independentAllocatorDirectWriteUnsupported = true;
+            return false;
+        }
+    }
+
+    private boolean sharesWriterAllocatorRoot(VectorSchemaRoot root) {
+        BufferAllocator writerRoot = allocator.getRoot();
+        for (FieldVector vector : root.getFieldVectors()) {
+            if (vector.getAllocator().getRoot() != writerRoot) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isAllocatorRootMismatch(Throwable throwable) {
+        while (throwable != null) {
+            String message = throwable.getMessage();
+            if (message != null
+                    && message.contains(
+                            "A buffer can only be associated between two allocators "
+                                    + "that share the same root")) {
+                return true;
+            }
+            throwable = throwable.getCause();
+        }
+        return false;
+    }
+
+    private void writeArrowRows(VectorSchemaRoot root) {
+        for (InternalRow row : new ArrowBatchReader(rowType, true).readBatch(root)) {
+            addElement(row);
+        }
     }
 
     private void flush() {

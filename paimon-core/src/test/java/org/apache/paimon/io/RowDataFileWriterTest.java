@@ -117,7 +117,7 @@ class RowDataFileWriterTest {
                         sequenceCounter,
                         new FileIndexOptions());
 
-        writer.writeBundle(rows(GenericRow.of(1), GenericRow.of(2)));
+        writer.writeBundle(directRows(GenericRow.of(1), GenericRow.of(2)));
 
         assertThat(formatWriter.bundleWrites).isZero();
         assertThat(formatWriter.rowWrites).isEqualTo(2);
@@ -143,7 +143,7 @@ class RowDataFileWriterTest {
                         sequenceCounter,
                         new FileIndexOptions());
 
-        writer.writeBundle(rows(GenericRow.of(1, 7L), GenericRow.of(2, 11L)));
+        writer.writeBundle(directRows(GenericRow.of(1, 7L), GenericRow.of(2, 11L)));
 
         assertThat(formatWriter.bundleWrites).isZero();
         assertThat(formatWriter.rowWrites).isEqualTo(2);
@@ -170,7 +170,7 @@ class RowDataFileWriterTest {
                         new LongCounter(),
                         fileIndexOptions);
 
-        writer.writeBundle(rows(GenericRow.of(1), GenericRow.of(2)));
+        writer.writeBundle(directRows(GenericRow.of(1), GenericRow.of(2)));
 
         assertThat(formatWriter.bundleWrites).isZero();
         assertThat(formatWriter.rowWrites).isEqualTo(2);
@@ -210,6 +210,10 @@ class RowDataFileWriterTest {
 
     private static BundleRecords rows(InternalRow... rows) {
         return new ListBundleRecords(Arrays.asList(rows));
+    }
+
+    private static BundleRecords directRows(InternalRow... rows) {
+        return new DirectListBundleRecords(Arrays.asList(rows));
     }
 
     private static class TestingFormatWriterFactory
@@ -283,12 +287,17 @@ class RowDataFileWriterTest {
         }
     }
 
-    private static class DirectNonIterableBundleRecords implements DirectWriteBundleRecords {
+    private static class DirectNonIterableBundleRecords implements BundleRecords {
 
         private final long rowCount;
 
         private DirectNonIterableBundleRecords(long rowCount) {
             this.rowCount = rowCount;
+        }
+
+        @Override
+        public boolean isDirectWriteBundle() {
+            return true;
         }
 
         @Override
@@ -318,6 +327,18 @@ class RowDataFileWriterTest {
         @Override
         public long rowCount() {
             return rows.size();
+        }
+    }
+
+    private static class DirectListBundleRecords extends ListBundleRecords {
+
+        private DirectListBundleRecords(List<InternalRow> rows) {
+            super(rows);
+        }
+
+        @Override
+        public boolean isDirectWriteBundle() {
+            return true;
         }
     }
 }

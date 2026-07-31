@@ -48,6 +48,7 @@ import org.apache.paimon.utils.VectorMappingUtils;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BaseVariableWidthVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -197,7 +198,6 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
                     return new MosaicArrowVectorizedRecordIterator(
                             filePath,
                             batchStartPosition,
-                            dataSchemaRowType,
                             projectedRowType,
                             arrowBatchReader,
                             vsr,
@@ -481,29 +481,40 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     private static class MosaicArrowVectorizedRecordIterator extends VectorizedRowIterator
             implements ArrowVectorizedRecordIterator {
 
-        private final RowType dataSchemaRowType;
         private final RowType arrowRowType;
-        private final ArrowBatchReader arrowBatchReader;
         private final VectorSchemaRoot vsr;
         private final BatchRecycler batchRecycler;
         private final BufferAllocator allocator;
         private final long startPosition;
-        @Nullable private VectorizedColumnBatch vectorizedBatch;
-        @Nullable private ColumnarRow columnarRow;
 
         private MosaicArrowVectorizedRecordIterator(
                 Path filePath,
                 long startPosition,
-                RowType dataSchemaRowType,
                 RowType arrowRowType,
                 ArrowBatchReader arrowBatchReader,
                 VectorSchemaRoot vsr,
                 BatchRecycler recycler,
                 BufferAllocator allocator) {
-            super(filePath, vsr.getRowCount(), recycler);
-            this.dataSchemaRowType = dataSchemaRowType;
+            this(
+                    filePath,
+                    startPosition,
+                    arrowRowType,
+                    arrowBatchReader.readVectorizedBatch(vsr),
+                    vsr,
+                    recycler,
+                    allocator);
+        }
+
+        private MosaicArrowVectorizedRecordIterator(
+                Path filePath,
+                long startPosition,
+                RowType arrowRowType,
+                VectorizedColumnBatch vectorizedBatch,
+                VectorSchemaRoot vsr,
+                BatchRecycler recycler,
+                BufferAllocator allocator) {
+            super(filePath, new ColumnarRow(vectorizedBatch), recycler);
             this.arrowRowType = arrowRowType;
-            this.arrowBatchReader = arrowBatchReader;
             this.vsr = vsr;
             this.batchRecycler = recycler;
             this.allocator = allocator;
@@ -512,30 +523,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         }
 
         @Override
-        public VectorizedColumnBatch batch() {
-            if (vectorizedBatch == null) {
-                vectorizedBatch = arrowBatchReader.readVectorizedBatch(vsr);
-            }
-            return vectorizedBatch;
-        }
-
-        @Override
-        protected ColumnarRow row() {
-            if (columnarRow == null) {
-                columnarRow = new ColumnarRow(batch());
-            }
-            return columnarRow;
-        }
-
-        @Override
         public ArrowBundleRecords arrowBundle() {
-            return new MosaicArrowBundleRecords(vsr, arrowRowType, arrowRowType);
-        }
-
-        @Override
-        public ColumnarRowIterator mapping(
-                @Nullable PartitionInfo partitionInfo, @Nullable int[] indexMapping) {
-            return mapping(dataSchemaRowType, partitionInfo, indexMapping);
+            return new MosaicArrowBundleRecords(vsr, arrowRowType);
         }
 
         @Override
@@ -557,8 +546,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
                     filePath,
                     startPosition,
                     outputRowType,
-                    arrowRowType,
-                    arrowBatchReader,
+                    batch(),
                     vsr,
                     batchRecycler,
                     allocator,
@@ -609,7 +597,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
                 }
             }
             return estimateSynthesizedPartitionBytes(
-                            outputRowType, partitionInfo, vsr.getRowCount())
+                            outputRowType, partitionInfo, vsr.getRowCount(), allocator)
                     <= MAX_SYNTHESIZED_PARTITION_ARROW_BYTES;
         }
 
@@ -667,15 +655,13 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         private final List<FieldVector> ownedPartitionVectors = new ArrayList<>();
 
         @Nullable private VectorSchemaRoot mappedVsr;
-        @Nullable private VectorizedColumnBatch mappedBatch;
         @Nullable private BufferAllocator partitionAllocator;
 
         private PartitionMappedMosaicArrowVectorizedRecordIterator(
                 Path filePath,
                 long startPosition,
                 RowType rowType,
-                RowType physicalRowType,
-                ArrowBatchReader arrowBatchReader,
+                VectorizedColumnBatch physicalBatch,
                 VectorSchemaRoot physicalVsr,
                 BatchRecycler recycler,
                 BufferAllocator allocator,
@@ -683,9 +669,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             super(
                     filePath,
                     startPosition,
-                    physicalRowType,
-                    physicalRowType,
-                    arrowBatchReader,
+                    rowType,
+                    createMappedBatch(physicalBatch, partitionInfo),
                     physicalVsr,
                     recycler,
                     allocator);
@@ -696,16 +681,12 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             recycler.addCleanup(this::closePartitionResources);
         }
 
-        @Override
-        public VectorizedColumnBatch batch() {
-            if (mappedBatch == null) {
-                VectorizedColumnBatch physicalBatch = super.batch();
-                ColumnVector[] mappedColumns =
-                        VectorMappingUtils.createPartitionMappedVectors(
-                                partitionInfo, physicalBatch.columns);
-                mappedBatch = physicalBatch.copy(mappedColumns);
-            }
-            return mappedBatch;
+        private static VectorizedColumnBatch createMappedBatch(
+                VectorizedColumnBatch physicalBatch, PartitionInfo partitionInfo) {
+            ColumnVector[] mappedColumns =
+                    VectorMappingUtils.createPartitionMappedVectors(
+                            partitionInfo, physicalBatch.columns);
+            return physicalBatch.copy(mappedColumns);
         }
 
         @Override
@@ -713,7 +694,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             if (mappedVsr == null) {
                 mappedVsr = createMappedVsr();
             }
-            return new MosaicArrowBundleRecords(mappedVsr, rowType, rowType);
+            return new MosaicArrowBundleRecords(mappedVsr, rowType);
         }
 
         private VectorSchemaRoot createMappedVsr() {
@@ -751,11 +732,19 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             FieldVector vector = ArrowUtils.createVector(field, partitionAllocator(), true);
             try {
                 int rowCount = physicalVsr.getRowCount();
-                vector.setInitialCapacity(rowCount);
-                vector.allocateNew();
-
                 BinaryRow partition = partitionInfo.getPartitionRow();
                 int partitionIndex = partitionInfo.getRealIndex(logicalIndex);
+                if (vector instanceof BaseVariableWidthVector) {
+                    long dataBytes =
+                            saturatedMultiply(
+                                    partitionValueBytes(field.type(), partition, partitionIndex),
+                                    rowCount);
+                    ((BaseVariableWidthVector) vector).allocateNew(dataBytes, rowCount);
+                } else {
+                    vector.setInitialCapacity(rowCount);
+                    vector.allocateNew();
+                }
+
                 ArrowFieldWriter writer =
                         field.type()
                                 .accept(ArrowFieldWriterFactoryVisitor.INSTANCE)
@@ -824,7 +813,10 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     }
 
     private static long estimateSynthesizedPartitionBytes(
-            RowType outputRowType, PartitionInfo partitionInfo, int rowCount) {
+            RowType outputRowType,
+            PartitionInfo partitionInfo,
+            int rowCount,
+            BufferAllocator allocator) {
         long total = 0;
         BinaryRow partition = partitionInfo.getPartitionRow();
         for (int i = 0; i < partitionInfo.size(); i++) {
@@ -838,18 +830,48 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             if (valueBytes == Long.MAX_VALUE) {
                 return Long.MAX_VALUE;
             }
+
+            DataTypeRoot root = type.getTypeRoot();
+            long dataBytes = saturatedMultiply(valueBytes, rowCount);
             long vectorBytes =
                     saturatedAdd(
                             PARTITION_VECTOR_BASE_BYTES,
-                            saturatedMultiply(
-                                    saturatedAdd(PARTITION_VALUE_ROW_OVERHEAD_BYTES, valueBytes),
-                                    rowCount));
+                            roundedAllocationBytes(allocator, dataBytes));
+            vectorBytes =
+                    saturatedAdd(
+                            vectorBytes, roundedAllocationBytes(allocator, (rowCount + 7L) / 8L));
+            if (isVariableWidth(root)) {
+                vectorBytes =
+                        saturatedAdd(
+                                vectorBytes,
+                                roundedAllocationBytes(
+                                        allocator, saturatedMultiply(rowCount + 1L, 4L)));
+            } else {
+                vectorBytes =
+                        saturatedAdd(
+                                vectorBytes,
+                                saturatedMultiply(PARTITION_VALUE_ROW_OVERHEAD_BYTES, rowCount));
+            }
             total = saturatedAdd(total, vectorBytes);
             if (total > MAX_SYNTHESIZED_PARTITION_ARROW_BYTES) {
                 return total;
             }
         }
         return total;
+    }
+
+    private static boolean isVariableWidth(DataTypeRoot root) {
+        return root == DataTypeRoot.CHAR
+                || root == DataTypeRoot.VARCHAR
+                || root == DataTypeRoot.BINARY
+                || root == DataTypeRoot.VARBINARY;
+    }
+
+    private static long roundedAllocationBytes(BufferAllocator allocator, long bytes) {
+        if (bytes == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        return allocator.getRoundingPolicy().getRoundedSize(bytes);
     }
 
     private static long partitionValueBytes(DataType type, BinaryRow partition, int index) {

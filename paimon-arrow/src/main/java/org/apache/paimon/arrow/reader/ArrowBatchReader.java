@@ -88,7 +88,7 @@ public class ArrowBatchReader {
                 };
     }
 
-    /** Convert an Arrow batch to Paimon column vectors without materializing rows. */
+    /** Wrap an Arrow batch as Paimon column vectors without materializing rows. */
     public VectorizedColumnBatch readVectorizedBatch(VectorSchemaRoot vsr) {
         ColumnVector[] columnVectors = new ColumnVector[projectedRowType.getFieldCount()];
         int[] mapping = new int[projectedRowType.getFieldCount()];

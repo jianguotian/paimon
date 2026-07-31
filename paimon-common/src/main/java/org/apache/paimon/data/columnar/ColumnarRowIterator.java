@@ -41,12 +41,9 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
 public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
         implements BatchColumnarRowIterator {
 
-    private static final int DYNAMIC_BATCH_ROW_COUNT = -1;
-
     protected final Path filePath;
-    @Nullable protected final ColumnarRow row;
+    protected final ColumnarRow row;
     protected final Runnable recycler;
-    private final int batchRowCount;
 
     protected int num;
     protected int index;
@@ -55,33 +52,19 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     protected LongIterator positionIterator;
 
     public ColumnarRowIterator(Path filePath, ColumnarRow row, @Nullable Runnable recycler) {
-        this(filePath, row, DYNAMIC_BATCH_ROW_COUNT, recycler);
-    }
-
-    protected ColumnarRowIterator(Path filePath, int batchRowCount, @Nullable Runnable recycler) {
-        this(filePath, null, batchRowCount, recycler);
-    }
-
-    private ColumnarRowIterator(
-            Path filePath,
-            @Nullable ColumnarRow row,
-            int batchRowCount,
-            @Nullable Runnable recycler) {
         super(recycler);
         this.filePath = filePath;
         this.row = row;
         this.recycler = recycler;
-        this.batchRowCount = batchRowCount;
     }
 
     public void reset(long nextFilePos) {
-        int rowCount = batchRowCount();
-        reset(LongIterator.fromRange(nextFilePos, nextFilePos + rowCount));
+        reset(LongIterator.fromRange(nextFilePos, nextFilePos + row.batch().getNumRows()));
     }
 
     public void reset(LongIterator positions) {
         this.positionIterator = positions;
-        this.num = batchRowCount();
+        this.num = row.batch().getNumRows();
         this.index = 0;
         this.returnedPositionIndex = 0;
         this.returnedPosition = -1;
@@ -91,9 +74,8 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     @Override
     public InternalRow next() {
         if (index < num) {
-            ColumnarRow currentRow = row();
-            currentRow.setRowId(index++);
-            return currentRow;
+            row.setRowId(index++);
+            return row;
         } else {
             return null;
         }
@@ -119,7 +101,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
 
     @Override
     public VectorizedColumnBatch batch() {
-        return row().batch();
+        return row.batch();
     }
 
     @Override
@@ -127,7 +109,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
         // We should call copy only when the iterator is at the beginning of the file.
         checkArgument(returnedPositionIndex == 0, "copy() should not be called after next()");
         ColumnarRowIterator newIterator =
-                new ColumnarRowIterator(filePath, row().copy(vectors), recycler);
+                new ColumnarRowIterator(filePath, row.copy(vectors), recycler);
         newIterator.reset(positionIterator);
         return newIterator;
     }
@@ -135,7 +117,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     public ColumnarRowIterator mapping(
             @Nullable PartitionInfo partitionInfo, @Nullable int[] indexMapping) {
         if (partitionInfo != null || indexMapping != null) {
-            VectorizedColumnBatch vectorizedColumnBatch = row().batch();
+            VectorizedColumnBatch vectorizedColumnBatch = row.batch();
             ColumnVector[] vectors = vectorizedColumnBatch.columns;
             if (partitionInfo != null) {
                 vectors = VectorMappingUtils.createPartitionMappedVectors(partitionInfo, vectors);
@@ -151,9 +133,8 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
     /**
      * Maps this batch to the final output row type.
      *
-     * <p>Subclasses which can preserve a native batch representation may override this overload to
-     * use the final row names and types. The default implementation keeps the existing mapping
-     * behavior.
+     * <p>Subclasses may override this method when preserving their native batch representation
+     * requires the final field names and types.
      */
     public ColumnarRowIterator mapping(
             RowType outputRowType,
@@ -164,7 +145,7 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
 
     public ColumnarRowIterator assignRowTracking(
             Long firstRowId, Long snapshotId, Map<String, Integer> meta) {
-        VectorizedColumnBatch vectorizedColumnBatch = row().batch();
+        VectorizedColumnBatch vectorizedColumnBatch = row.batch();
         ColumnVector[] vectors = vectorizedColumnBatch.columns;
 
         if (meta.containsKey(SpecialFields.ROW_ID.name())) {
@@ -211,18 +192,5 @@ public class ColumnarRowIterator extends RecyclableIterator<InternalRow>
 
         copy(vectors);
         return this;
-    }
-
-    protected ColumnarRow row() {
-        if (row == null) {
-            throw new IllegalStateException("Columnar row has not been initialized.");
-        }
-        return row;
-    }
-
-    private int batchRowCount() {
-        return batchRowCount == DYNAMIC_BATCH_ROW_COUNT
-                ? row().batch().getNumRows()
-                : batchRowCount;
     }
 }

@@ -18,7 +18,6 @@
 
 package org.apache.paimon.data.columnar;
 
-import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.columnar.heap.HeapIntVector;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.utils.LongIterator;
@@ -32,32 +31,6 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 
 /** Test for {@link ColumnarRowIterator}. */
 public class ColumnarRowIteratorTest {
-
-    @Test
-    public void testResetUsesCurrentBatchRowCount() {
-        HeapIntVector heapIntVector = new HeapIntVector(2);
-        heapIntVector.setInt(0, 10);
-        heapIntVector.setInt(1, 20);
-        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {heapIntVector});
-        ColumnarRowIterator iterator =
-                new ColumnarRowIterator(new Path("test"), new ColumnarRow(batch), null);
-
-        batch.setNumRows(2);
-        iterator.reset(5);
-        InternalRow first = iterator.next();
-        assertThat(first.getInt(0)).isEqualTo(10);
-        assertThat(iterator.returnedPosition()).isEqualTo(5);
-        InternalRow second = iterator.next();
-        assertThat(second.getInt(0)).isEqualTo(20);
-        assertThat(iterator.returnedPosition()).isEqualTo(6);
-        assertThat(iterator.next()).isNull();
-
-        batch.setNumRows(1);
-        iterator.reset(9);
-        assertThat(iterator.next().getInt(0)).isEqualTo(10);
-        assertThat(iterator.returnedPosition()).isEqualTo(9);
-        assertThat(iterator.next()).isNull();
-    }
 
     @Test
     public void testRowIterator() {

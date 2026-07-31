@@ -21,10 +21,7 @@ package org.apache.paimon.arrow.reader;
 import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.reader.VectorizedRecordIterator;
 
-/**
- * A {@link VectorizedRecordIterator} which can expose its original Arrow batch without converting
- * it to Paimon column vectors first.
- */
+/** A {@link VectorizedRecordIterator} which can expose its Arrow batch for direct bundle writes. */
 public interface ArrowVectorizedRecordIterator extends VectorizedRecordIterator {
 
     /** Returns the original Arrow batch. The batch is valid until {@link #releaseBatch()}. */

@@ -19,24 +19,19 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.io.DirectWriteBundleRecords;
 import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.vector.VectorSchemaRoot;
 
 /** A schema-verified Mosaic Arrow batch backed by buffers owned by its reader iterator. */
-final class MosaicArrowBundleRecords extends ArrowBundleRecords
-        implements DirectWriteBundleRecords {
+final class MosaicArrowBundleRecords extends ArrowBundleRecords {
 
-    private final Object schemaIdentity;
-
-    MosaicArrowBundleRecords(
-            VectorSchemaRoot vectorSchemaRoot, RowType rowType, Object schemaIdentity) {
+    MosaicArrowBundleRecords(VectorSchemaRoot vectorSchemaRoot, RowType rowType) {
         super(vectorSchemaRoot, rowType, true);
-        this.schemaIdentity = schemaIdentity;
     }
 
-    Object schemaIdentity() {
-        return schemaIdentity;
+    @Override
+    public boolean isDirectWriteBundle() {
+        return true;
     }
 }

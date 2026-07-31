@@ -37,8 +37,7 @@ final class MosaicArrowSchemaCompatibility {
     private MosaicArrowSchemaCompatibility() {}
 
     static boolean matchesRowType(RowType expected, RowType actual) {
-        if (expected.isNullable() != actual.isNullable()
-                || expected.getFieldCount() != actual.getFieldCount()) {
+        if (expected.getFieldCount() != actual.getFieldCount()) {
             return false;
         }
 
@@ -51,8 +50,7 @@ final class MosaicArrowSchemaCompatibility {
     }
 
     static boolean matchesRowTypeByName(RowType expected, RowType actual) {
-        if (expected.isNullable() != actual.isNullable()
-                || expected.getFieldCount() != actual.getFieldCount()) {
+        if (expected.getFieldCount() != actual.getFieldCount()) {
             return false;
         }
 
