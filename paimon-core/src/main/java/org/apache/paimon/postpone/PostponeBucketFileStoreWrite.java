@@ -24,7 +24,6 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.deletionvectors.BucketedDvMaintainer;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.format.FileFormat;
-import org.apache.paimon.format.avro.AvroSchemaConverter;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.KeyValueFileReaderFactory;
@@ -53,7 +52,6 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -104,7 +102,9 @@ public class PostponeBucketFileStoreWrite extends MemoryFileStoreWrite<KeyValue>
         Options newOptions = new Options(options.toMap());
         try {
             // use avro for postpone bucket
-            AvroSchemaConverter.convertToSchema(schema.logicalRowType(), new HashMap<>());
+            Options avroOptions = new Options(options.toMap());
+            avroOptions.set(CoreOptions.FILE_FORMAT, "avro");
+            fileFormat(new CoreOptions(avroOptions)).validateDataFields(schema.logicalRowType());
             newOptions.set(CoreOptions.FILE_FORMAT, "avro");
             newOptions.set(CoreOptions.METADATA_STATS_MODE, "none");
         } catch (Exception e) {
