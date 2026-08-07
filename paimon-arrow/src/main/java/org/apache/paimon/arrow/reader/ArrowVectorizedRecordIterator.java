@@ -24,6 +24,11 @@ import org.apache.paimon.reader.VectorizedRecordIterator;
 /** A {@link VectorizedRecordIterator} which can expose its Arrow batch for direct bundle writes. */
 public interface ArrowVectorizedRecordIterator extends VectorizedRecordIterator {
 
-    /** Returns the original Arrow batch. The batch is valid until {@link #releaseBatch()}. */
+    /**
+     * Returns a borrowed view of the Arrow vectors backing {@link #batch()}.
+     *
+     * <p>The caller does not own the batch and must not retain or close it. Its row order and count
+     * correspond to {@link #batch()}, and it is valid only until {@link #releaseBatch()}.
+     */
     ArrowBundleRecords arrowBundle();
 }

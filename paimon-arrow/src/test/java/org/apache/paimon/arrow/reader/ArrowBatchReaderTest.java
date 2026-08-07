@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ArrowBatchReaderTest {
 
     @Test
-    void testVectorizedBatchesAreIndependent() {
+    void testVectorizedBatchWrappersAreNotReused() {
         RowType rowType = RowType.builder().field("id", DataTypes.INT()).build();
         try (RootAllocator allocator = new RootAllocator();
                 VectorSchemaRoot firstRoot = intRoot(rowType, allocator, 11);

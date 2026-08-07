@@ -90,12 +90,17 @@ public class ArrowBatchReader {
                 };
     }
 
-    /** Wrap an Arrow batch as Paimon column vectors without materializing rows. */
+    /**
+     * Wraps an Arrow batch as Paimon column vectors without materializing rows.
+     *
+     * <p>The returned batch container is not reused, but its columns borrow vectors owned by {@code
+     * vsr} and must not be used after the root is released.
+     */
     public VectorizedColumnBatch readVectorizedBatch(VectorSchemaRoot vsr) {
-        VectorizedColumnBatch independentBatch =
+        VectorizedColumnBatch resultBatch =
                 new VectorizedColumnBatch(new ColumnVector[projectedRowType.getFieldCount()]);
-        populateBatch(vsr, independentBatch);
-        return independentBatch;
+        populateBatch(vsr, resultBatch);
+        return resultBatch;
     }
 
     private void populateBatch(VectorSchemaRoot vsr, VectorizedColumnBatch targetBatch) {
