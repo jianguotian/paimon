@@ -19,6 +19,7 @@
 package org.apache.paimon.arrow.reader;
 
 import org.apache.paimon.arrow.ArrowUtils;
+import org.apache.paimon.data.columnar.ColumnarRow;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
@@ -32,6 +33,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link ArrowBatchReader}. */
 class ArrowBatchReaderTest {
+
+    @Test
+    void testReadBatchWrapperIsReused() {
+        RowType rowType = RowType.builder().field("id", DataTypes.INT()).build();
+        try (RootAllocator allocator = new RootAllocator();
+                VectorSchemaRoot firstRoot = intRoot(rowType, allocator, 11);
+                VectorSchemaRoot secondRoot = intRoot(rowType, allocator, 22)) {
+            ArrowBatchReader reader = new ArrowBatchReader(rowType, true);
+
+            ColumnarRow first = (ColumnarRow) reader.readBatch(firstRoot).iterator().next();
+            VectorizedColumnBatch reusableBatch = first.batch();
+            assertThat(first.getInt(0)).isEqualTo(11);
+
+            ColumnarRow second = (ColumnarRow) reader.readBatch(secondRoot).iterator().next();
+
+            assertThat(second.batch()).isSameAs(reusableBatch);
+            assertThat(second.getInt(0)).isEqualTo(22);
+        }
+    }
 
     @Test
     void testVectorizedBatchWrappersAreNotReused() {

@@ -85,6 +85,37 @@ class RowDataFileWriterTest {
     }
 
     @Test
+    void testExtractorStatsAllowBundleFastPath() throws Exception {
+        TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
+        TestingExtractStatsProducer statsProducer = new TestingExtractStatsProducer();
+        LongCounter sequenceCounter = new LongCounter(5);
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO(),
+                        ROW_TYPE,
+                        formatWriter,
+                        statsProducer,
+                        sequenceCounter,
+                        new FileIndexOptions());
+        BundleRecords bundle = new DirectNonIterableBundleRecords(3);
+
+        writer.writeBundle(bundle);
+
+        assertThat(formatWriter.writtenBundle).isSameAs(bundle);
+        assertThat(formatWriter.bundleWrites).isEqualTo(1);
+        assertThat(formatWriter.rowWrites).isZero();
+        assertThat(writer.recordCount()).isEqualTo(3);
+        assertThat(sequenceCounter.getValue()).isEqualTo(8);
+
+        writer.close();
+        DataFileMeta result = writer.result();
+        assertThat(statsProducer.extractCalls).isEqualTo(1);
+        assertThat(result.valueStats().minValues().getInt(0)).isEqualTo(1);
+        assertThat(result.valueStats().maxValues().getInt(0)).isEqualTo(3);
+        assertThat(result.valueStats().nullCounts().getLong(0)).isZero();
+    }
+
+    @Test
     void testUnmarkedBundleFallsBackToRows() throws Exception {
         TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
         RowDataFileWriter writer =
@@ -284,6 +315,32 @@ class RowDataFileWriterTest {
         @Override
         public SimpleColStats[] extract(FileIO fileIO, Path path, long length) {
             return new SimpleColStats[] {SimpleColStats.NONE};
+        }
+    }
+
+    private static class TestingExtractStatsProducer implements SimpleStatsProducer {
+
+        private int extractCalls;
+
+        @Override
+        public boolean isStatsDisabled() {
+            return false;
+        }
+
+        @Override
+        public boolean requirePerRecord() {
+            return false;
+        }
+
+        @Override
+        public void collect(InternalRow row) {
+            throw new AssertionError("Extractor-backed statistics must not collect rows.");
+        }
+
+        @Override
+        public SimpleColStats[] extract(FileIO fileIO, Path path, long length) {
+            extractCalls++;
+            return new SimpleColStats[] {new SimpleColStats(1, 3, 0L)};
         }
     }
 
