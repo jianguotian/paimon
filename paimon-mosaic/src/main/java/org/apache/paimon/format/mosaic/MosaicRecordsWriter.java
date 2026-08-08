@@ -19,7 +19,6 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.BundleFormatWriter;
@@ -162,9 +161,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
                     verifiedDirectSchema = bundleSchema;
                 }
             }
-            if (directCompatible
-                    && (trustedMosaicBundle
-                            || ArrowUtils.hasSameRootAllocator(root, allocator))) {
+            if (directCompatible) {
                 writeDirectArrow(root, arrowBundle.rowCount());
                 return;
             }
@@ -176,8 +173,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
                 return;
             }
             if (!trustedMosaicBundle
-                    && MosaicArrowSchemaCompatibility.matchesRowValues(
-                            rowType, bundleRowType)) {
+                    && MosaicArrowSchemaCompatibility.matchesRowValues(rowType, bundleRowType)) {
                 genericBundleRows += arrowBundle.rowCount();
                 writeRows(arrowBundle);
                 return;

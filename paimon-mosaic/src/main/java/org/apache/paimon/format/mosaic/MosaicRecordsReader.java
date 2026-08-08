@@ -461,13 +461,34 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         }
 
         @Override
+        public VectorizedRowIterator copy(ColumnVector[] vectors) {
+            ColumnVector[] current = batch().columns;
+            if (current.length == vectors.length) {
+                boolean identityMapping = true;
+                for (int i = 0; i < current.length; i++) {
+                    if (current[i] != vectors[i]) {
+                        identityMapping = false;
+                        break;
+                    }
+                }
+                if (identityMapping) {
+                    return this;
+                }
+            }
+            return vectorizedFallback(vectors);
+        }
+
+        @Override
         public ColumnarRowIterator assignRowTracking(
                 Long firstRowId, Long snapshotId, Map<String, Integer> meta) {
             return vectorizedFallback().assignRowTracking(firstRowId, snapshotId, meta);
         }
 
         private VectorizedRowIterator vectorizedFallback() {
-            ColumnVector[] columns = batch().columns.clone();
+            return vectorizedFallback(batch().columns.clone());
+        }
+
+        private VectorizedRowIterator vectorizedFallback(ColumnVector[] columns) {
             VectorizedColumnBatch copiedBatch = batch().copy(columns);
             VectorizedRowIterator iterator =
                     new VectorizedRowIterator(
