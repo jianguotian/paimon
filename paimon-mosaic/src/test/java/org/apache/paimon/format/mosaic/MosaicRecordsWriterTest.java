@@ -105,7 +105,7 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
-    void testCompatibleCrossRootGenericArrowBundleFallsBackToRows() throws Exception {
+    void testCompatibleCrossRootGenericArrowBundleUsesDirectWrite() throws Exception {
         RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
         RootAllocator writerAllocator = new RootAllocator();
@@ -120,15 +120,13 @@ class MosaicRecordsWriterTest {
 
             writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
 
-            verify(nativeWriter, never()).write(same(root));
-            assertThat(writer.directArrowRows()).isZero();
+            verify(nativeWriter).write(same(root));
+            assertThat(writer.directArrowRows()).isEqualTo(1);
             assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
-            assertThat(writer.genericBundleRows()).isEqualTo(1);
+            assertThat(writer.genericBundleRows()).isZero();
         } finally {
             writer.close();
         }
-
-        verify(nativeWriter).write(any(VectorSchemaRoot.class));
     }
 
     @Test

@@ -19,6 +19,7 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.arrow.reader.ArrowVectorizedRecordIterator;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.FileSystemCatalog;
 import org.apache.paimon.catalog.Identifier;
@@ -123,6 +124,48 @@ class PartitionColumnsOutsidePhysicalMosaicTest {
                 table.newReadBuilder().withProjection(new int[] {4, 2}),
                 Arrays.asList("rpt_dt", "dt"),
                 Collections.singletonList(row(RPT_DT, DT)));
+    }
+
+    @Test
+    void testPhysicalProjectionRetainsArrowBundle() throws Exception {
+        DataSplit split = planSingleSplit(table.newReadBuilder(), 1);
+        InnerTableRead read =
+                table.newRead().withReadType(table.rowType().project(BUSINESS_COLUMNS));
+
+        try (RecordReader<InternalRow> reader = read.createReader(split)) {
+            RecordReader.RecordIterator<InternalRow> batch = reader.readBatch();
+            assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+            try {
+                ArrowVectorizedRecordIterator arrowBatch = (ArrowVectorizedRecordIterator) batch;
+                assertThat(arrowBatch.arrowBundle().getRowType().getFieldNames())
+                        .containsExactlyElementsOf(BUSINESS_COLUMNS);
+                assertThat(arrowBatch.arrowBundle().getVectorSchemaRoot().getSchema().getFields())
+                        .extracting(org.apache.arrow.vector.types.pojo.Field::getName)
+                        .containsExactlyElementsOf(BUSINESS_COLUMNS);
+            } finally {
+                batch.releaseBatch();
+            }
+        }
+    }
+
+    @Test
+    void testManifestPartitionInjectionFallsBackFromArrowBundle() throws Exception {
+        DataSplit split = planSingleSplit(table.newReadBuilder(), 1);
+
+        try (RecordReader<InternalRow> reader = table.newRead().createReader(split)) {
+            RecordReader.RecordIterator<InternalRow> batch = reader.readBatch();
+            assertThat(batch).isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+            try {
+                InternalRow row = batch.next();
+                assertThat(row.getString(0).toString()).isEqualTo(PAYLOAD);
+                assertThat(row.getString(1).toString()).isEqualTo(VIN);
+                assertThat(row.getString(2).toString()).isEqualTo(DT);
+                assertThat(row.getString(3).toString()).isEqualTo(HH);
+                assertThat(row.getString(4).toString()).isEqualTo(RPT_DT);
+            } finally {
+                batch.releaseBatch();
+            }
+        }
     }
 
     @Test
