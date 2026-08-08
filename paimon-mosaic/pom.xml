@@ -31,11 +31,15 @@ under the License.
     <artifactId>paimon-mosaic</artifactId>
     <name>Paimon : Mosaic Format</name>
 
+    <properties>
+        <mosaic.version>0.3.0-SNAPSHOT</mosaic.version>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>org.apache.paimon</groupId>
             <artifactId>mosaic</artifactId>
-            <version>0.2.0</version>
+            <version>${mosaic.version}</version>
         </dependency>
 
         <dependency>
