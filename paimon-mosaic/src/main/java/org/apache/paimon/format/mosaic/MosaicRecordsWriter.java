@@ -124,7 +124,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     }
 
     @Override
-    public void writeBundle(BundleRecords bundleRecords) {
+    public void writeBundle(BundleRecords bundleRecords) throws IOException {
         if (bundleRecords instanceof ArrowBundleRecords) {
             ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
             VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
@@ -136,9 +136,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             }
         }
 
-        for (InternalRow row : bundleRecords) {
-            addElement(row);
-        }
+        BundleFormatWriter.super.writeBundle(bundleRecords);
     }
 
     @Override

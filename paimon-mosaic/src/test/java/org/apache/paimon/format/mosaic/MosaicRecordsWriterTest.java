@@ -115,6 +115,34 @@ class MosaicRecordsWriterTest {
         verify(nativeWriter).write(any(VectorSchemaRoot.class));
     }
 
+    @Test
+    void testReorderedArrowBundleFallsBackToRows() throws Exception {
+        RowType writerType =
+                RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
+        RowType sourceType =
+                RowType.builder().field("b", DataTypes.INT()).field("a", DataTypes.INT()).build();
+        RootAllocator writerAllocator = new RootAllocator();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        MosaicRecordsWriter writer = createWriter(writerType, writerAllocator, nativeWriter);
+
+        try (BufferAllocator sourceAllocator =
+                        writerAllocator.newChildAllocator(
+                                "mosaic-reordered-test", 0, Long.MAX_VALUE);
+                VectorSchemaRoot root =
+                        ArrowUtils.createVectorSchemaRoot(sourceType, sourceAllocator)) {
+            setInt((IntVector) root.getVector("b"), 20);
+            setInt((IntVector) root.getVector("a"), 10);
+            root.setRowCount(1);
+
+            writer.writeBundle(new ArrowBundleRecords(root, writerType, true));
+
+            verify(nativeWriter, never()).write(same(root));
+        }
+        writer.close();
+
+        verify(nativeWriter).write(any(VectorSchemaRoot.class));
+    }
+
     private static MosaicRecordsWriter createWriter(
             RowType rowType, RootAllocator allocator, MosaicWriter nativeWriter) {
         return new MosaicRecordsWriter(

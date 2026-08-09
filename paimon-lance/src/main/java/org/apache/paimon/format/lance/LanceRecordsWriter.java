@@ -18,13 +18,10 @@
 
 package org.apache.paimon.format.lance;
 
-import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.format.lance.jni.LanceWriter;
-import org.apache.paimon.io.BundleRecords;
 
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.slf4j.Logger;
@@ -61,23 +58,6 @@ public class LanceRecordsWriter implements BundleFormatWriter {
                 throw new RuntimeException("Exception happens while write to lance file");
             }
         }
-    }
-
-    @Override
-    public void writeBundle(BundleRecords bundleRecords) throws IOException {
-        if (bundleRecords instanceof ArrowBundleRecords) {
-            ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
-            VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
-            if (arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle)
-                    && ArrowUtils.hasSameRootAllocator(root, arrowFormatWriter.getAllocator())) {
-                flush();
-                nativeWriter.ensureInitialized(arrowFormatWriter.getAllocator());
-                add(root);
-                return;
-            }
-        }
-
-        BundleFormatWriter.super.writeBundle(bundleRecords);
     }
 
     public void add(VectorSchemaRoot vsr) throws IOException {

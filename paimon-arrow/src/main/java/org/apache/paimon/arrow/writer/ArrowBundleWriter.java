@@ -18,7 +18,6 @@
 
 package org.apache.paimon.arrow.writer;
 
-import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowCStruct;
 import org.apache.paimon.arrow.vector.ArrowFormatCWriter;
@@ -27,8 +26,6 @@ import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.fs.PositionOutputStream;
-import org.apache.paimon.io.BundleRecords;
-import org.apache.paimon.io.VectorizedBundleRecords;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -73,26 +70,6 @@ public class ArrowBundleWriter implements BundleFormatWriter {
         }
     }
 
-    @Override
-    public void writeBundle(BundleRecords bundleRecords) throws IOException {
-        if (bundleRecords instanceof ArrowBundleRecords) {
-            ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
-            VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
-            if (arrowFormatWriter.formatWriter().isArrowBundleSchemaCompatible(arrowBundle)
-                    && ArrowUtils.hasSameRootAllocator(root, root.getVector(0).getAllocator())) {
-                flush();
-                add(root);
-                return;
-            }
-        } else if (bundleRecords instanceof VectorizedBundleRecords) {
-            VectorizedBundleRecords records = (VectorizedBundleRecords) bundleRecords;
-            add(records.batch(), records.selected());
-            return;
-        }
-
-        BundleFormatWriter.super.writeBundle(bundleRecords);
-    }
-
     public void add(VectorSchemaRoot vsr) {
         long t1 = System.currentTimeMillis();
         BufferAllocator bufferAllocator = vsr.getVector(0).getAllocator();
@@ -102,11 +79,9 @@ public class ArrowBundleWriter implements BundleFormatWriter {
                     ArrowUtils.serializeToCStruct(vsr, array, schema, bufferAllocator);
             long t2 = System.currentTimeMillis();
             serializeCost += (t2 - t1);
-            try {
-                this.nativeWriter.writeIpcBytes(struct.arrayAddress(), struct.schemaAddress());
-            } finally {
-                ArrowUtils.releaseCDataIfNeeded(array, schema);
-            }
+            this.nativeWriter.writeIpcBytes(struct.arrayAddress(), struct.schemaAddress());
+            array.release();
+            schema.release();
             jniCost += (System.currentTimeMillis() - t2);
         } catch (RuntimeException e) {
             LOG.error("Exception happens while add vsr", e);

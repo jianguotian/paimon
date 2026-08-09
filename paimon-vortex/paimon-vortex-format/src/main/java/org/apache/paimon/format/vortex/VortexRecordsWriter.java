@@ -18,22 +18,15 @@
 
 package org.apache.paimon.format.vortex;
 
-import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.vector.ArrowCStruct;
 import org.apache.paimon.arrow.vector.ArrowFormatCWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.fs.Path;
-import org.apache.paimon.io.BundleRecords;
 
 import dev.vortex.api.Session;
 import dev.vortex.api.VortexWriter;
-import org.apache.arrow.c.ArrowArray;
-import org.apache.arrow.c.ArrowSchema;
-import org.apache.arrow.c.Data;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -100,20 +93,6 @@ public class VortexRecordsWriter implements BundleFormatWriter {
     }
 
     @Override
-    public void writeBundle(BundleRecords bundleRecords) throws IOException {
-        if (bundleRecords instanceof ArrowBundleRecords) {
-            ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
-            if (currentWriter.formatWriter().isArrowBundleSchemaCompatible(arrowBundle)) {
-                flush();
-                writeBundleVsr(arrowBundle.getVectorSchemaRoot());
-                return;
-            }
-        }
-
-        BundleFormatWriter.super.writeBundle(bundleRecords);
-    }
-
-    @Override
     public boolean reachTargetSize(boolean suggestedCheck, long targetSize) {
         return suggestedCheck && (long) (ffiBytes * COMPRESSION_RATIO) >= targetSize;
     }
@@ -169,34 +148,6 @@ public class VortexRecordsWriter implements BundleFormatWriter {
             // Retain it so buffer memory stays alive for async Rust reads.
             retainedResources.add(currentWriter);
             currentWriter = cWriterSupplier.get();
-        }
-    }
-
-    /** Write an external VSR (from writeBundle) via IPC copy into an independent allocator. */
-    private void writeBundleVsr(VectorSchemaRoot vsr) throws IOException {
-        ffiBytes += bufferBytes(vsr);
-        byte[] ipc = org.apache.paimon.arrow.ArrowUtils.serializeToIpc(vsr);
-        RootAllocator bundleAllocator = new RootAllocator(Long.MAX_VALUE);
-        try {
-            ArrowStreamReader ipcReader =
-                    new ArrowStreamReader(new java.io.ByteArrayInputStream(ipc), bundleAllocator);
-            ipcReader.loadNextBatch();
-            VectorSchemaRoot copy = ipcReader.getVectorSchemaRoot();
-
-            ArrowArray arrowArray = ArrowArray.allocateNew(bundleAllocator);
-            ArrowSchema arrowSchema = ArrowSchema.allocateNew(bundleAllocator);
-            Data.exportVectorSchemaRoot(bundleAllocator, copy, null, arrowArray, arrowSchema);
-            long t1 = System.currentTimeMillis();
-            nativeWriter.writeBatch(arrowArray.memoryAddress(), arrowSchema.memoryAddress());
-            jniCost += (System.currentTimeMillis() - t1);
-            // Retain all resources that own the exported C Data buffers and release
-            // callbacks. Rust holds async zero-copy references via Arc<FFI_ArrowArray>.
-            // Order matters: close ipcReader (owns VectorSchemaRoot) before allocator.
-            retainedResources.add(ipcReader);
-            retainedResources.add(bundleAllocator);
-        } catch (Exception e) {
-            closeQuietly(bundleAllocator);
-            throw e instanceof IOException ? (IOException) e : new IOException(e);
         }
     }
 
