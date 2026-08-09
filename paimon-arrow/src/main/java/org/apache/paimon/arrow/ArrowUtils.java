@@ -285,17 +285,17 @@ public class ArrowUtils {
 
     /**
      * Returns whether the schema root contains at least one vector and all top-level and nested
-     * vectors share the same root allocator as {@code allocator}.
+     * vectors share one root allocator.
      */
-    public static boolean hasSameRootAllocator(
-            VectorSchemaRoot vectorSchemaRoot, BufferAllocator allocator) {
+    public static boolean hasSingleRootAllocator(VectorSchemaRoot vectorSchemaRoot) {
         if (vectorSchemaRoot.getFieldVectors().isEmpty()) {
             return false;
         }
 
-        BufferAllocator expectedRoot = rootAllocator(allocator);
+        BufferAllocator expectedRoot =
+                rootAllocator(vectorSchemaRoot.getFieldVectors().get(0).getAllocator());
         for (FieldVector vector : vectorSchemaRoot.getFieldVectors()) {
-            if (!hasSameRootAllocator(vector, expectedRoot)) {
+            if (!hasRootAllocator(vector, expectedRoot)) {
                 return false;
             }
         }
@@ -344,13 +344,13 @@ public class ArrowUtils {
         return current;
     }
 
-    private static boolean hasSameRootAllocator(FieldVector vector, BufferAllocator expectedRoot) {
+    private static boolean hasRootAllocator(FieldVector vector, BufferAllocator expectedRoot) {
         if (rootAllocator(vector.getAllocator()) != expectedRoot) {
             return false;
         }
 
         for (FieldVector child : vector.getChildrenFromFields()) {
-            if (!hasSameRootAllocator(child, expectedRoot)) {
+            if (!hasRootAllocator(child, expectedRoot)) {
                 return false;
             }
         }
