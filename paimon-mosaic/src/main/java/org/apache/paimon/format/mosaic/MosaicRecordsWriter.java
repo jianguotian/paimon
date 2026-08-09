@@ -128,6 +128,8 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         if (bundleRecords instanceof ArrowBundleRecords) {
             ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
             VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
+            // Direct Mosaic writes require a compatible schema and the same allocator root;
+            // otherwise row fallback rebuilds the batch with the writer allocator.
             if (arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle)
                     && ArrowUtils.hasSameRootAllocator(root, allocator)) {
                 flush();
@@ -136,7 +138,14 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             }
         }
 
-        BundleFormatWriter.super.writeBundle(bundleRecords);
+        for (InternalRow row : bundleRecords) {
+            addElement(row);
+        }
+    }
+
+    @Override
+    public boolean supportsRowEquivalentBundleWrite() {
+        return true;
     }
 
     @Override

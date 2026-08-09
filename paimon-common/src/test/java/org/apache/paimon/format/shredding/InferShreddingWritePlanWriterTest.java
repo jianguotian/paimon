@@ -118,7 +118,9 @@ class InferShreddingWritePlanWriterTest {
         @Override
         public void writeBundle(BundleRecords bundle) throws IOException {
             bundleWriteCount++;
-            BundleFormatWriter.super.writeBundle(bundle);
+            for (InternalRow row : bundle) {
+                addElement(row);
+            }
         }
 
         @Override

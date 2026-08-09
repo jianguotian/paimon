@@ -284,8 +284,8 @@ public class ArrowUtils {
     }
 
     /**
-     * Returns whether the root is non-empty and every top-level and nested vector shares the
-     * allocator's root allocator.
+     * Returns whether the schema root contains at least one vector and all top-level and nested
+     * vectors share the same root allocator as {@code allocator}.
      */
     public static boolean hasSameRootAllocator(
             VectorSchemaRoot vectorSchemaRoot, BufferAllocator allocator) {
