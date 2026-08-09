@@ -74,7 +74,6 @@ class RowDataFileWriterTest {
 
         writer.writeBundle(bundle);
 
-        assertThat(bundle.rowCountCalls).isEqualTo(1);
         assertThat(bundle.iteratorCalls).isZero();
         assertThat(formatWriter.writtenBundle).isSameAs(bundle);
         assertThat(formatWriter.bundleWrites).isEqualTo(1);
@@ -107,7 +106,6 @@ class RowDataFileWriterTest {
 
         writer.writeBundle(bundle);
 
-        assertThat(bundle.rowCountCalls).isEqualTo(1);
         assertThat(bundle.iteratorCalls).isZero();
         assertThat(formatWriter.writtenBundle).isSameAs(bundle);
         assertThat(formatWriter.bundleWrites).isEqualTo(1);
@@ -473,7 +471,6 @@ class RowDataFileWriterTest {
 
         private final List<InternalRow> rows;
         private int iteratorCalls;
-        private int rowCountCalls;
 
         private TrackingBundleRecords(List<InternalRow> rows) {
             this.rows = rows;
@@ -487,7 +484,6 @@ class RowDataFileWriterTest {
 
         @Override
         public long rowCount() {
-            rowCountCalls++;
             return rows.size();
         }
     }

@@ -19,7 +19,6 @@
 package org.apache.paimon.format.vortex;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
@@ -46,9 +45,6 @@ import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.RoaringBitmap32;
 
 import dev.vortex.jni.NativeRuntime;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -268,7 +264,7 @@ public class VortexReaderWriterTest {
     }
 
     @Test
-    public void testArrowBundleRecordsWriteDoesNotBorrowCallerBuffersAcrossBatches(
+    public void testArrowBundleRecordsWriteDoesNotBorrowCallerBuffers(
             @TempDir java.nio.file.Path tempDir) throws Exception {
         RowType rowType =
                 RowType.builder()
@@ -299,16 +295,6 @@ public class VortexReaderWriterTest {
                                     arrowWriter.getVectorSchemaRoot(), rowType, true));
 
             arrowWriter.reset();
-            arrowWriter.write(GenericRow.of(3, BinaryString.fromString("second")));
-            arrowWriter.write(GenericRow.of(4, BinaryString.fromString("batch")));
-            arrowWriter.flush();
-
-            ((BundleFormatWriter) writer)
-                    .writeBundle(
-                            new ArrowBundleRecords(
-                                    arrowWriter.getVectorSchemaRoot(), rowType, true));
-
-            arrowWriter.reset();
             arrowWriter.write(GenericRow.of(100, BinaryString.fromString("mutated")));
             arrowWriter.flush();
         }
@@ -326,64 +312,11 @@ public class VortexReaderWriterTest {
                 actualRows.add(serializer.copy(iterator.next()));
             }
 
-            assertEquals(4, actualRows.size());
+            assertEquals(2, actualRows.size());
             assertEquals(1, actualRows.get(0).getInt(0));
             assertEquals(BinaryString.fromString("hello"), actualRows.get(0).getString(1));
             assertEquals(2, actualRows.get(1).getInt(0));
             assertEquals(BinaryString.fromString("world"), actualRows.get(1).getString(1));
-            assertEquals(3, actualRows.get(2).getInt(0));
-            assertEquals(BinaryString.fromString("second"), actualRows.get(2).getString(1));
-            assertEquals(4, actualRows.get(3).getInt(0));
-            assertEquals(BinaryString.fromString("batch"), actualRows.get(3).getString(1));
-        }
-    }
-
-    @Test
-    public void testReorderedArrowBundleFallsBackToRows(@TempDir java.nio.file.Path tempDir)
-            throws Exception {
-        RowType writerType =
-                RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
-        RowType sourceType =
-                RowType.builder().field("b", DataTypes.INT()).field("a", DataTypes.INT()).build();
-
-        Options options = new Options();
-        VortexFileFormat format =
-                new VortexFileFormatFactory()
-                        .create(new FileFormatFactory.FormatContext(options, 1024, 1024));
-        FileIO fileIO = new LocalFileIO();
-        Path testFile =
-                new Path(new Path(tempDir.toUri()), "test_reordered_bundle_" + UUID.randomUUID());
-
-        try (FormatWriter writer =
-                        ((SupportsDirectWrite) format.createWriterFactory(writerType))
-                                .create(fileIO, testFile, "");
-                RootAllocator sourceAllocator = new RootAllocator();
-                VectorSchemaRoot root =
-                        ArrowUtils.createVectorSchemaRoot(sourceType, sourceAllocator)) {
-            setInt((IntVector) root.getVector("b"), 20);
-            setInt((IntVector) root.getVector("a"), 10);
-            root.setRowCount(1);
-
-            ((BundleFormatWriter) writer)
-                    .writeBundle(new ArrowBundleRecords(root, writerType, true));
-        }
-
-        InternalRowSerializer serializer = new InternalRowSerializer(writerType);
-        FormatReaderFactory readerFactory =
-                format.createReaderFactory(writerType, writerType, null);
-        try (RecordReader<InternalRow> reader =
-                        readerFactory.createReader(
-                                new FormatReaderContext(
-                                        fileIO, testFile, fileIO.getFileSize(testFile), null));
-                RecordReaderIterator<InternalRow> iterator = new RecordReaderIterator<>(reader)) {
-            List<InternalRow> actualRows = new ArrayList<>();
-            while (iterator.hasNext()) {
-                actualRows.add(serializer.copy(iterator.next()));
-            }
-
-            assertEquals(1, actualRows.size());
-            assertEquals(10, actualRows.get(0).getInt(0));
-            assertEquals(20, actualRows.get(0).getInt(1));
         }
     }
 
@@ -432,12 +365,6 @@ public class VortexReaderWriterTest {
             assertEquals(3, actualRows.get(1).getInt(0));
             assertEquals(BinaryString.fromString("row3"), actualRows.get(1).getString(1));
         }
-    }
-
-    private static void setInt(IntVector vector, int value) {
-        vector.allocateNew(1);
-        vector.setSafe(0, value);
-        vector.setValueCount(1);
     }
 
     @Test

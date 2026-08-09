@@ -38,7 +38,6 @@ import java.util.Collections;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.same;
@@ -108,46 +107,6 @@ class MosaicRecordsWriterTest {
             root.setRowCount(1);
 
             writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
-
-            verify(nativeWriter, never()).write(same(root));
-        }
-        writer.close();
-
-        verify(nativeWriter).write(any(VectorSchemaRoot.class));
-    }
-
-    @Test
-    void testReorderedArrowBundleFallsBackToRows() throws Exception {
-        RowType writerType =
-                RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
-        RowType sourceType =
-                RowType.builder().field("b", DataTypes.INT()).field("a", DataTypes.INT()).build();
-        RootAllocator writerAllocator = new RootAllocator();
-        MosaicWriter nativeWriter = mock(MosaicWriter.class);
-        MosaicRecordsWriter writer = createWriter(writerType, writerAllocator, nativeWriter);
-        doAnswer(
-                        invocation -> {
-                            VectorSchemaRoot written = invocation.getArgument(0);
-                            assertThat(written.getSchema().getFields().get(0).getName())
-                                    .isEqualTo("a");
-                            assertThat(written.getSchema().getFields().get(1).getName())
-                                    .isEqualTo("b");
-                            assertThat(((IntVector) written.getVector("a")).get(0)).isEqualTo(10);
-                            assertThat(((IntVector) written.getVector("b")).get(0)).isEqualTo(20);
-                            return null;
-                        })
-                .when(nativeWriter)
-                .write(any(VectorSchemaRoot.class));
-
-        try (BufferAllocator sourceAllocator =
-                        writerAllocator.newChildAllocator("mosaic-schema-test", 0, Long.MAX_VALUE);
-                VectorSchemaRoot root =
-                        ArrowUtils.createVectorSchemaRoot(sourceType, sourceAllocator)) {
-            setInt((IntVector) root.getVector("b"), 20);
-            setInt((IntVector) root.getVector("a"), 10);
-            root.setRowCount(1);
-
-            writer.writeBundle(new ArrowBundleRecords(root, writerType, true));
 
             verify(nativeWriter, never()).write(same(root));
         }

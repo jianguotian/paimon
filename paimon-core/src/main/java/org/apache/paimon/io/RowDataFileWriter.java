@@ -149,9 +149,9 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
         if (auxiliaryFileWriters.isEmpty()
                 && sequenceNumberTracker.supportsRowCountUpdate()
                 && !requiresPerRecordStats()) {
-            long previousRecordCount = recordCount();
+            long rowCount = bundle.rowCount();
             super.writeBundle(bundle);
-            sequenceNumberTracker.updateByRowCount(recordCount() - previousRecordCount);
+            sequenceNumberTracker.updateByRowCount(rowCount);
             return;
         }
 

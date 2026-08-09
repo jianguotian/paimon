@@ -19,7 +19,6 @@
 package org.apache.paimon.format.vortex;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowCStruct;
 import org.apache.paimon.arrow.vector.ArrowFormatCWriter;
 import org.apache.paimon.data.InternalRow;
@@ -39,9 +38,6 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nullable;
-
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -68,11 +64,6 @@ public class VortexRecordsWriter implements BundleFormatWriter {
     // release) remains in each retained resource until nativeWriter.close().
     private final List<AutoCloseable> retainedResources;
     private ArrowFormatCWriter currentWriter;
-
-    // Direct bundles are copied into this writer-owned allocator. Each handoff exports
-    // independent buffer references, so temporary readers can close immediately.
-    // nativeWriter.close() completes outstanding writes before this allocator is closed.
-    @Nullable private RootAllocator bundleAllocator;
 
     private long jniCost = 0;
     private long ffiBytes = 0;
@@ -147,26 +138,10 @@ public class VortexRecordsWriter implements BundleFormatWriter {
 
         // Release all retained resources now that async writes are done.
         for (AutoCloseable res : retainedResources) {
-            try {
-                closeQuietly(res);
-            } catch (Throwable t) {
-                throwable = addSuppressed(throwable, t);
-            }
+            closeQuietly(res);
         }
         retainedResources.clear();
-        try {
-            closeQuietly(currentWriter);
-        } catch (Throwable t) {
-            throwable = addSuppressed(throwable, t);
-        }
-
-        if (bundleAllocator != null) {
-            try {
-                bundleAllocator.close();
-            } catch (Throwable t) {
-                throwable = addSuppressed(throwable, t);
-            }
-        }
+        closeQuietly(currentWriter);
 
         try {
             session.close();
@@ -197,36 +172,32 @@ public class VortexRecordsWriter implements BundleFormatWriter {
         }
     }
 
-    /** Write an external VSR (from writeBundle) via IPC copy into the writer-owned allocator. */
+    /** Write an external VSR (from writeBundle) via IPC copy into an independent allocator. */
     private void writeBundleVsr(VectorSchemaRoot vsr) throws IOException {
         ffiBytes += bufferBytes(vsr);
-        byte[] ipc = ArrowUtils.serializeToIpc(vsr);
-        RootAllocator allocator = bundleAllocator();
-        try (ArrowStreamReader reader =
-                        new ArrowStreamReader(new ByteArrayInputStream(ipc), allocator);
-                ArrowArray array = ArrowArray.allocateNew(allocator);
-                ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-            if (!reader.loadNextBatch()) {
-                throw new IOException("Arrow IPC copy did not contain a record batch.");
-            }
-            Data.exportVectorSchemaRoot(
-                    allocator, reader.getVectorSchemaRoot(), null, array, schema);
+        byte[] ipc = org.apache.paimon.arrow.ArrowUtils.serializeToIpc(vsr);
+        RootAllocator bundleAllocator = new RootAllocator(Long.MAX_VALUE);
+        try {
+            ArrowStreamReader ipcReader =
+                    new ArrowStreamReader(new java.io.ByteArrayInputStream(ipc), bundleAllocator);
+            ipcReader.loadNextBatch();
+            VectorSchemaRoot copy = ipcReader.getVectorSchemaRoot();
 
+            ArrowArray arrowArray = ArrowArray.allocateNew(bundleAllocator);
+            ArrowSchema arrowSchema = ArrowSchema.allocateNew(bundleAllocator);
+            Data.exportVectorSchemaRoot(bundleAllocator, copy, null, arrowArray, arrowSchema);
             long t1 = System.currentTimeMillis();
-            try {
-                nativeWriter.writeBatch(array.memoryAddress(), schema.memoryAddress());
-            } finally {
-                ArrowUtils.releaseCDataIfNeeded(array, schema);
-            }
+            nativeWriter.writeBatch(arrowArray.memoryAddress(), arrowSchema.memoryAddress());
             jniCost += (System.currentTimeMillis() - t1);
+            // Retain all resources that own the exported C Data buffers and release
+            // callbacks. Rust holds async zero-copy references via Arc<FFI_ArrowArray>.
+            // Order matters: close ipcReader (owns VectorSchemaRoot) before allocator.
+            retainedResources.add(ipcReader);
+            retainedResources.add(bundleAllocator);
+        } catch (Exception e) {
+            closeQuietly(bundleAllocator);
+            throw e instanceof IOException ? (IOException) e : new IOException(e);
         }
-    }
-
-    private RootAllocator bundleAllocator() {
-        if (bundleAllocator == null) {
-            bundleAllocator = new RootAllocator(Long.MAX_VALUE);
-        }
-        return bundleAllocator;
     }
 
     private static long bufferBytes(VectorSchemaRoot vsr) {

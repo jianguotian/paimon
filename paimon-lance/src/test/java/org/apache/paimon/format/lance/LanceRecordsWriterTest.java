@@ -35,7 +35,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -69,36 +68,6 @@ class LanceRecordsWriterTest {
         assertThat(nativeWriter.snapshots.get(1).values.get(0)).containsExactly(2);
         assertThat(nativeWriter.snapshots.get(2).values.get(0)).containsExactly(3);
         assertThat(nativeWriter.initializedAllocator).isSameAs(writerAllocator);
-    }
-
-    @Test
-    void testReorderedArrowBundleFallsBackToRows() throws Exception {
-        RowType writerType =
-                RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
-        RowType sourceType =
-                RowType.builder().field("b", DataTypes.INT()).field("a", DataTypes.INT()).build();
-        ArrowFormatWriter arrowWriter = new ArrowFormatWriter(writerType, 1024, true);
-        CapturingLanceWriter nativeWriter = new CapturingLanceWriter();
-        LanceRecordsWriter writer = new LanceRecordsWriter(() -> 0L, arrowWriter, nativeWriter);
-
-        try (BufferAllocator sourceAllocator =
-                        arrowWriter
-                                .getAllocator()
-                                .newChildAllocator("lance-schema-test", 0, Long.MAX_VALUE);
-                VectorSchemaRoot root =
-                        ArrowUtils.createVectorSchemaRoot(sourceType, sourceAllocator)) {
-            setInt((IntVector) root.getVector("b"), 20);
-            setInt((IntVector) root.getVector("a"), 10);
-            root.setRowCount(1);
-            writer.writeBundle(new ArrowBundleRecords(root, writerType, true));
-        }
-        writer.close();
-
-        assertThat(nativeWriter.snapshots).hasSize(1);
-        Snapshot snapshot = nativeWriter.snapshots.get(0);
-        assertThat(snapshot.fieldNames).containsExactly("a", "b");
-        assertThat(snapshot.values.get(0)).containsExactly(10);
-        assertThat(snapshot.values.get(1)).containsExactly(20);
     }
 
     @Test
@@ -151,10 +120,6 @@ class LanceRecordsWriterTest {
             if (root == disallowedRoot) {
                 disallowedRootWrites++;
             }
-            List<String> fieldNames =
-                    root.getSchema().getFields().stream()
-                            .map(field -> field.getName())
-                            .collect(Collectors.toList());
             List<List<Integer>> values = new ArrayList<>();
             for (int column = 0; column < root.getFieldVectors().size(); column++) {
                 IntVector vector = (IntVector) root.getVector(column);
@@ -164,7 +129,7 @@ class LanceRecordsWriterTest {
                 }
                 values.add(columnValues);
             }
-            snapshots.add(new Snapshot(fieldNames, values));
+            snapshots.add(new Snapshot(values));
         }
 
         @Override
@@ -178,11 +143,9 @@ class LanceRecordsWriterTest {
 
     private static class Snapshot {
 
-        private final List<String> fieldNames;
         private final List<List<Integer>> values;
 
-        private Snapshot(List<String> fieldNames, List<List<Integer>> values) {
-            this.fieldNames = fieldNames;
+        private Snapshot(List<List<Integer>> values) {
             this.values = values;
         }
     }

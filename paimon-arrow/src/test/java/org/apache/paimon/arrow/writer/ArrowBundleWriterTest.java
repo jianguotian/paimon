@@ -129,7 +129,7 @@ public class ArrowBundleWriterTest {
     }
 
     @Test
-    public void testLogicalRowTypeMismatchFallsBackToRows() throws Exception {
+    public void testFieldDescriptionDoesNotDisableDirectWrite() throws Exception {
         RowType writerType = RowType.builder().field("value", DataTypes.INT()).build();
         RowType bundleType =
                 new RowType(
@@ -137,14 +137,25 @@ public class ArrowBundleWriterTest {
                                 new DataField(
                                         0, "value", DataTypes.INT(), "different description")));
         ArrowFormatCWriter cWriter = new ArrowFormatCWriter(writerType, 1024, true);
-        VectorSchemaRoot writerRoot = cWriter.getVectorSchemaRoot();
-        CapturingNativeWriter nativeWriter = new CapturingNativeWriter(writerRoot, cWriter);
+        List<VectorSchemaRoot> directWrites = new ArrayList<>();
+        NativeWriter nativeWriter =
+                new NativeWriter() {
+                    @Override
+                    public long nativeMemoryUsed() {
+                        return 0;
+                    }
+
+                    @Override
+                    public void writeIpcBytes(long arrayAddress, long schemaAddress) {}
+
+                    @Override
+                    public void close() {}
+                };
         ArrowBundleWriter writer =
                 new ArrowBundleWriter(new NoOpPositionOutputStream(), cWriter, nativeWriter) {
                     @Override
                     public void add(VectorSchemaRoot vsr) {
-                        throw new AssertionError(
-                                "Logically incompatible Arrow bundle must use row fallback.");
+                        directWrites.add(vsr);
                     }
                 };
 
@@ -154,11 +165,24 @@ public class ArrowBundleWriterTest {
             root.setRowCount(1);
 
             writer.writeBundle(new ArrowBundleRecords(root, bundleType, true));
+            assertThat(directWrites).containsExactly(root);
         }
         writer.close();
+    }
 
-        assertThat(nativeWriter.snapshots).hasSize(1);
-        assertThat(nativeWriter.snapshots.get(0).objectColumns.get(0)).containsExactly(10);
+    @Test
+    public void testLogicalTypeMismatchDisablesDirectWrite() {
+        RowType writerType = RowType.builder().field("value", DataTypes.VARCHAR(10)).build();
+        RowType bundleType = RowType.builder().field("value", DataTypes.CHAR(10)).build();
+        try (ArrowFormatCWriter cWriter = new ArrowFormatCWriter(writerType, 1024, true);
+                RootAllocator allocator = new RootAllocator();
+                VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(writerType, allocator)) {
+            assertThat(
+                            cWriter.formatWriter()
+                                    .isArrowBundleSchemaCompatible(
+                                            new ArrowBundleRecords(root, bundleType, true)))
+                    .isFalse();
+        }
     }
 
     @Test
