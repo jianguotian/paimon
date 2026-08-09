@@ -18,6 +18,7 @@
 
 package org.apache.paimon.arrow.writer;
 
+import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowCStruct;
 import org.apache.paimon.arrow.vector.ArrowFormatCWriter;
@@ -26,6 +27,8 @@ import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.fs.PositionOutputStream;
+import org.apache.paimon.io.BundleRecords;
+import org.apache.paimon.io.VectorizedBundleRecords;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -66,6 +69,20 @@ public class ArrowBundleWriter implements BundleFormatWriter {
             flush();
             if (!arrowFormatWriter.write(internalRow)) {
                 throw new RuntimeException("Exception happens while writing arrow record");
+            }
+        }
+    }
+
+    @Override
+    public void writeBundle(BundleRecords bundleRecords) throws IOException {
+        if (bundleRecords instanceof ArrowBundleRecords) {
+            add(((ArrowBundleRecords) bundleRecords).getVectorSchemaRoot());
+        } else if (bundleRecords instanceof VectorizedBundleRecords) {
+            VectorizedBundleRecords records = (VectorizedBundleRecords) bundleRecords;
+            add(records.batch(), records.selected());
+        } else {
+            for (InternalRow row : bundleRecords) {
+                addElement(row);
             }
         }
     }
