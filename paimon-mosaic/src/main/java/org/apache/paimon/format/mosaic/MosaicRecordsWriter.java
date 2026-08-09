@@ -124,14 +124,14 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     }
 
     @Override
-    public void writeBundle(BundleRecords bundleRecords) throws IOException {
+    public void writeBundle(BundleRecords bundleRecords) {
         if (bundleRecords instanceof ArrowBundleRecords) {
             ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
             VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
-            // Direct Mosaic writes accept an input allocator root independent from the writer.
-            // Mixed-root input vectors fall back to rows to preserve row-equivalent behavior.
+            // Mosaic exports the borrowed vectors through the writer allocator, so direct writes
+            // require every source vector to share its root; otherwise preserve semantics via rows.
             if (arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle)
-                    && ArrowUtils.hasSingleRootAllocator(root)) {
+                    && ArrowUtils.hasSameRootAllocator(root, allocator)) {
                 flush();
                 nativeWriter.write(root);
                 return;

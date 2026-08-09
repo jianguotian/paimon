@@ -28,18 +28,17 @@ import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
-import java.util.Arrays;
 import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.same;
@@ -96,7 +95,7 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
-    void testCompatibleDifferentAllocatorRootUsesDirectWrite() throws Exception {
+    void testDifferentAllocatorRootFallsBackToRows() throws Exception {
         RowType rowType = RowType.builder().field("value", DataTypes.INT()).build();
         RootAllocator writerAllocator = new RootAllocator();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
@@ -110,37 +109,7 @@ class MosaicRecordsWriterTest {
 
             writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
 
-            verify(nativeWriter).write(same(root));
-        }
-        writer.close();
-    }
-
-    @Test
-    void testMixedAllocatorRootsFallBackToRows() throws Exception {
-        RowType rowType =
-                RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
-        RootAllocator writerAllocator = new RootAllocator();
-        MosaicWriter nativeWriter = mock(MosaicWriter.class);
-        MosaicRecordsWriter writer = createWriter(rowType, writerAllocator, nativeWriter);
-
-        try (RootAllocator firstAllocator = new RootAllocator();
-                RootAllocator secondAllocator = new RootAllocator()) {
-            FieldVector first =
-                    ArrowUtils.createVector(rowType.getFields().get(0), firstAllocator, true);
-            FieldVector second =
-                    ArrowUtils.createVector(rowType.getFields().get(1), secondAllocator, true);
-            try (VectorSchemaRoot root =
-                    new VectorSchemaRoot(
-                            Arrays.asList(first.getField(), second.getField()),
-                            Arrays.asList(first, second),
-                            1)) {
-                setInt((IntVector) first, 10);
-                setInt((IntVector) second, 20);
-
-                writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
-
-                verify(nativeWriter, never()).write(same(root));
-            }
+            verify(nativeWriter, never()).write(same(root));
         }
         writer.close();
 
@@ -156,6 +125,19 @@ class MosaicRecordsWriterTest {
         RootAllocator writerAllocator = new RootAllocator();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
         MosaicRecordsWriter writer = createWriter(writerType, writerAllocator, nativeWriter);
+        doAnswer(
+                        invocation -> {
+                            VectorSchemaRoot written = invocation.getArgument(0);
+                            assertThat(written.getSchema().getFields().get(0).getName())
+                                    .isEqualTo("a");
+                            assertThat(written.getSchema().getFields().get(1).getName())
+                                    .isEqualTo("b");
+                            assertThat(((IntVector) written.getVector("a")).get(0)).isEqualTo(10);
+                            assertThat(((IntVector) written.getVector("b")).get(0)).isEqualTo(20);
+                            return null;
+                        })
+                .when(nativeWriter)
+                .write(any(VectorSchemaRoot.class));
 
         try (BufferAllocator sourceAllocator =
                         writerAllocator.newChildAllocator(

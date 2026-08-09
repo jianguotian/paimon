@@ -126,20 +126,20 @@ public class ArrowUtilsTest {
     }
 
     @Test
-    public void testSingleRootAllocatorIncludesNestedVectors() {
+    public void testSameRootAllocatorIncludesNestedVectors() {
         try (RootAllocator allocator = new RootAllocator();
                 BufferAllocator childAllocator =
                         allocator.newChildAllocator("same-root-child", 0, Long.MAX_VALUE);
                 VectorSchemaRoot root =
                         nestedRoot(allocator, new IntVector("value", childAllocator))) {
-            Assertions.assertThat(ArrowUtils.hasSingleRootAllocator(root)).isTrue();
+            Assertions.assertThat(ArrowUtils.hasSameRootAllocator(root, allocator)).isTrue();
         }
 
         try (RootAllocator allocator = new RootAllocator();
                 RootAllocator differentRoot = new RootAllocator();
                 VectorSchemaRoot root =
                         nestedRoot(allocator, new IntVector("value", differentRoot))) {
-            Assertions.assertThat(ArrowUtils.hasSingleRootAllocator(root)).isFalse();
+            Assertions.assertThat(ArrowUtils.hasSameRootAllocator(root, allocator)).isFalse();
         }
     }
 
