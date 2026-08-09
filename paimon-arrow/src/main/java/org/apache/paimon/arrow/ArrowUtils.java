@@ -296,7 +296,10 @@ public class ArrowUtils {
         return out.toByteArray();
     }
 
-    /** Returns whether every vector in the root shares the allocator's root allocator. */
+    /**
+     * Returns whether the root is non-empty and every top-level and nested vector shares the
+     * allocator's root allocator.
+     */
     public static boolean hasSameRootAllocator(
             VectorSchemaRoot vectorSchemaRoot, BufferAllocator allocator) {
         if (vectorSchemaRoot.getFieldVectors().isEmpty()) {

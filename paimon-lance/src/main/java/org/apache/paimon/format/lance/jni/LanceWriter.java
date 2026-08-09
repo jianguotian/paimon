@@ -59,8 +59,9 @@ public class LanceWriter {
     }
 
     /**
-     * Initializes the native writer with an allocator whose lifetime is owned by the surrounding
-     * format writer.
+     * Initializes the native writer with the supplied allocator.
+     *
+     * <p>The caller retains ownership and must keep the allocator open until {@link #close()}.
      */
     public void ensureInitialized(BufferAllocator bufferAllocator) throws IOException {
         initWriteLazy(bufferAllocator);

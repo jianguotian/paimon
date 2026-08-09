@@ -95,8 +95,7 @@ class MosaicBundleWriteIntegrationTest {
                 setInts((IntVector) root.getVector("value"), 1, 2, 3);
                 root.setRowCount(3);
 
-                TrackingDirectArrowBundleRecords bundle =
-                        new TrackingDirectArrowBundleRecords(root, rowType);
+                TrackingArrowBundleRecords bundle = new TrackingArrowBundleRecords(root, rowType);
                 nativeWriter.expectDirectRoot(root);
                 writer.writeBundle(bundle);
                 nativeWriter.clearExpectedRoot();
@@ -273,21 +272,6 @@ class MosaicBundleWriteIntegrationTest {
             return true;
         } catch (Throwable t) {
             return false;
-        }
-    }
-
-    private static class TrackingDirectArrowBundleRecords extends ArrowBundleRecords {
-
-        private int iteratorCalls;
-
-        private TrackingDirectArrowBundleRecords(VectorSchemaRoot root, RowType rowType) {
-            super(root, rowType, true);
-        }
-
-        @Override
-        public Iterator<InternalRow> iterator() {
-            iteratorCalls++;
-            return super.iterator();
         }
     }
 
