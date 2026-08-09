@@ -268,7 +268,7 @@ public class VortexReaderWriterTest {
     }
 
     @Test
-    public void testArrowBundleRecordsWriteDoesNotBorrowCallerBuffers(
+    public void testArrowBundleRecordsWriteDoesNotBorrowCallerBuffersAcrossBatches(
             @TempDir java.nio.file.Path tempDir) throws Exception {
         RowType rowType =
                 RowType.builder()
@@ -299,6 +299,16 @@ public class VortexReaderWriterTest {
                                     arrowWriter.getVectorSchemaRoot(), rowType, true));
 
             arrowWriter.reset();
+            arrowWriter.write(GenericRow.of(3, BinaryString.fromString("second")));
+            arrowWriter.write(GenericRow.of(4, BinaryString.fromString("batch")));
+            arrowWriter.flush();
+
+            ((BundleFormatWriter) writer)
+                    .writeBundle(
+                            new ArrowBundleRecords(
+                                    arrowWriter.getVectorSchemaRoot(), rowType, true));
+
+            arrowWriter.reset();
             arrowWriter.write(GenericRow.of(100, BinaryString.fromString("mutated")));
             arrowWriter.flush();
         }
@@ -316,11 +326,15 @@ public class VortexReaderWriterTest {
                 actualRows.add(serializer.copy(iterator.next()));
             }
 
-            assertEquals(2, actualRows.size());
+            assertEquals(4, actualRows.size());
             assertEquals(1, actualRows.get(0).getInt(0));
             assertEquals(BinaryString.fromString("hello"), actualRows.get(0).getString(1));
             assertEquals(2, actualRows.get(1).getInt(0));
             assertEquals(BinaryString.fromString("world"), actualRows.get(1).getString(1));
+            assertEquals(3, actualRows.get(2).getInt(0));
+            assertEquals(BinaryString.fromString("second"), actualRows.get(2).getString(1));
+            assertEquals(4, actualRows.get(3).getInt(0));
+            assertEquals(BinaryString.fromString("batch"), actualRows.get(3).getString(1));
         }
     }
 

@@ -49,6 +49,7 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for {@link ArrowBundleWriter}. */
 public class ArrowBundleWriterTest {
@@ -226,6 +227,50 @@ public class ArrowBundleWriterTest {
         assertThat(nativeWriter.snapshots).hasSize(1);
         assertThat(nativeWriter.snapshots.get(0).objectColumns.get(0)).containsExactly(10);
         assertThat(nativeWriter.snapshots.get(0).objectColumns.get(1)).containsExactly(20);
+    }
+
+    @Test
+    public void testDirectWriteFailureReleasesExportedReferences() throws Exception {
+        RowType rowType = RowType.builder().field("value", DataTypes.INT()).build();
+        ArrowFormatCWriter cWriter = new ArrowFormatCWriter(rowType, 1024, true);
+        RuntimeException failure = new RuntimeException("Expected native write failure.");
+        NativeWriter nativeWriter =
+                new NativeWriter() {
+                    @Override
+                    public long nativeMemoryUsed() {
+                        return 0;
+                    }
+
+                    @Override
+                    public void writeIpcBytes(long arrayAddress, long schemaAddress) {
+                        throw failure;
+                    }
+
+                    @Override
+                    public void close() {}
+                };
+        ArrowBundleWriter writer =
+                new ArrowBundleWriter(new NoOpPositionOutputStream(), cWriter, nativeWriter);
+
+        try {
+            try (RootAllocator allocator = new RootAllocator()) {
+                try (VectorSchemaRoot root =
+                        ArrowUtils.createVectorSchemaRoot(rowType, allocator)) {
+                    setInt((IntVector) root.getVector("value"), 10);
+                    root.setRowCount(1);
+
+                    assertThatThrownBy(
+                                    () ->
+                                            writer.writeBundle(
+                                                    new ArrowBundleRecords(root, rowType, true)))
+                            .isSameAs(failure);
+                }
+
+                assertThat(allocator.getAllocatedMemory()).isZero();
+            }
+        } finally {
+            writer.close();
+        }
     }
 
     @Test

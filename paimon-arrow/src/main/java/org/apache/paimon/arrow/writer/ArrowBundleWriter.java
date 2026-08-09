@@ -102,9 +102,11 @@ public class ArrowBundleWriter implements BundleFormatWriter {
                     ArrowUtils.serializeToCStruct(vsr, array, schema, bufferAllocator);
             long t2 = System.currentTimeMillis();
             serializeCost += (t2 - t1);
-            this.nativeWriter.writeIpcBytes(struct.arrayAddress(), struct.schemaAddress());
-            array.release();
-            schema.release();
+            try {
+                this.nativeWriter.writeIpcBytes(struct.arrayAddress(), struct.schemaAddress());
+            } finally {
+                ArrowUtils.releaseCDataIfNeeded(array, schema);
+            }
             jniCost += (System.currentTimeMillis() - t2);
         } catch (RuntimeException e) {
             LOG.error("Exception happens while add vsr", e);
