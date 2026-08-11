@@ -88,7 +88,7 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testPublicWriterFactoryFallsBackForCrossRootArrowBundle() throws IOException {
+    void testPublicWriterFactoryDirectWritesCrossRootArrowBundle() throws IOException {
         RowType rowType = RowType.builder().field("value", DataTypes.INT()).build();
         Path path = newPath();
         MosaicFileFormat format = createFormat();
@@ -110,7 +110,7 @@ class MosaicReaderWriterTest {
 
             CountingArrowBundleRecords bundle = new CountingArrowBundleRecords(root, rowType);
             writer.writeBundle(bundle);
-            assertThat(bundle.iteratorCalls()).isEqualTo(1);
+            assertThat(bundle.iteratorCalls()).isZero();
         }
 
         List<InternalRow> result = readAll(rowType, rowType, path, null);

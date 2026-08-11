@@ -95,7 +95,7 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
-    void testDifferentAllocatorRootFallsBackToRows() throws Exception {
+    void testDifferentAllocatorRootUsesDirectWrite() throws Exception {
         RowType rowType = RowType.builder().field("value", DataTypes.INT()).build();
         RootAllocator writerAllocator = new RootAllocator();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
@@ -109,11 +109,9 @@ class MosaicRecordsWriterTest {
 
             writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
 
-            verify(nativeWriter, never()).write(same(root));
+            verify(nativeWriter).write(same(root));
         }
         writer.close();
-
-        verify(nativeWriter).write(any(VectorSchemaRoot.class));
     }
 
     @Test

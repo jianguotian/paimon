@@ -306,6 +306,16 @@ public class ArrowUtils {
         return !vectors.isEmpty() && allVectorsShareRootWith(vectors, allocator.getRoot());
     }
 
+    /**
+     * Returns whether the schema root contains at least one vector and all top-level and nested
+     * vectors share one allocator root.
+     */
+    public static boolean hasSingleRootAllocator(VectorSchemaRoot vectorSchemaRoot) {
+        List<FieldVector> vectors = vectorSchemaRoot.getFieldVectors();
+        return !vectors.isEmpty()
+                && allVectorsShareRootWith(vectors, vectors.get(0).getAllocator().getRoot());
+    }
+
     public static void serializeToIpc(VectorSchemaRoot vsr, OutputStream out) {
         try (ArrowStreamWriter writer = new ArrowStreamWriter(vsr, null, out)) {
             writer.writeBatch();
