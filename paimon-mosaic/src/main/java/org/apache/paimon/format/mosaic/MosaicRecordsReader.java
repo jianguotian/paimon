@@ -425,7 +425,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     interface NativeReaderOpener {
 
         MosaicReader open(
-                MosaicInputFileAdapter inputFileAdapter, long fileSize, BufferAllocator allocator);
+                MosaicInputFileAdapter inputFileAdapter, long fileSize, BufferAllocator allocator)
+                throws IOException;
     }
 
     private class BatchRecycler implements Runnable {
