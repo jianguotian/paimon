@@ -235,7 +235,6 @@ class MosaicReaderWriterTest {
         assertThat(targetFile.maxSequenceNumber()).isEqualTo(10);
         assertThat(mosaicWriter.directArrowRows()).isEqualTo(6);
         assertThat(mosaicWriter.schemaCompatibilityFallbackRows()).isZero();
-        assertThat(mosaicWriter.mixedInputAllocatorFallbackRows()).isZero();
 
         List<InternalRow> result = readAll(rowType, rowType, targetPath, null);
         assertThat(result).hasSize(6);
@@ -277,7 +276,6 @@ class MosaicReaderWriterTest {
 
             assertThat(targetWriter.directArrowRows()).isEqualTo(1);
             assertThat(targetWriter.schemaCompatibilityFallbackRows()).isZero();
-            assertThat(targetWriter.mixedInputAllocatorFallbackRows()).isZero();
         }
 
         List<InternalRow> result = readAll(rowType, rowType, targetPath, null);

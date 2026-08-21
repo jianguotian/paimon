@@ -122,7 +122,6 @@ class MosaicRecordsWriterTest {
             verify(nativeWriter).write(same(root));
             assertThat(writer.directArrowRows()).isEqualTo(1);
             assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
-            assertThat(writer.mixedInputAllocatorFallbackRows()).isZero();
             assertThat(writer.genericBundleRows()).isZero();
         } finally {
             writer.close();
@@ -148,7 +147,6 @@ class MosaicRecordsWriterTest {
             verify(nativeWriter).write(same(root));
             assertThat(writer.directArrowRows()).isEqualTo(1);
             assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
-            assertThat(writer.mixedInputAllocatorFallbackRows()).isZero();
             assertThat(writer.genericBundleRows()).isZero();
         } finally {
             writer.close();
@@ -156,7 +154,7 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
-    void testMixedRootArrowBundleFallsBackToRows() throws Exception {
+    void testCompatibleMixedRootArrowBundleUsesDirectWrite() throws Exception {
         RowType rowType =
                 RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
@@ -180,17 +178,14 @@ class MosaicRecordsWriterTest {
 
                 writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
 
-                verify(nativeWriter, never()).write(same(root));
-                assertThat(writer.directArrowRows()).isZero();
+                verify(nativeWriter).write(same(root));
+                assertThat(writer.directArrowRows()).isEqualTo(1);
                 assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
-                assertThat(writer.mixedInputAllocatorFallbackRows()).isEqualTo(1);
                 assertThat(writer.genericBundleRows()).isZero();
             }
         } finally {
             writer.close();
         }
-
-        verify(nativeWriter).write(any(VectorSchemaRoot.class));
     }
 
     @Test

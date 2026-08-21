@@ -19,7 +19,6 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.BundleFormatWriter;
@@ -57,7 +56,6 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     @Nullable private Schema verifiedDirectSchema;
     private long directArrowRows;
     private long schemaCompatibilityFallbackRows;
-    private long mixedInputAllocatorFallbackRows;
     private long genericBundleRows;
     @Nullable private MosaicWriterMetadata metadata;
 
@@ -160,13 +158,11 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
                     verifiedDirectSchema = bundleSchema;
                 }
             }
-            if (directCompatible && hasSingleInputAllocatorRoot(root)) {
+            if (directCompatible) {
                 writeDirectArrow(root, arrowBundle.rowCount());
                 return;
             }
-            if (directCompatible) {
-                mixedInputAllocatorFallbackRows += arrowBundle.rowCount();
-            } else if (trustedMosaicBundle) {
+            if (trustedMosaicBundle) {
                 schemaCompatibilityFallbackRows += arrowBundle.rowCount();
             } else {
                 genericBundleRows += arrowBundle.rowCount();
@@ -253,21 +249,12 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         directArrowRows += rowCount;
     }
 
-    private static boolean hasSingleInputAllocatorRoot(VectorSchemaRoot root) {
-        return !root.getFieldVectors().isEmpty()
-                && ArrowUtils.hasSameRootAllocator(root, root.getVector(0).getAllocator());
-    }
-
     long directArrowRows() {
         return directArrowRows;
     }
 
     long schemaCompatibilityFallbackRows() {
         return schemaCompatibilityFallbackRows;
-    }
-
-    long mixedInputAllocatorFallbackRows() {
-        return mixedInputAllocatorFallbackRows;
     }
 
     long genericBundleRows() {
