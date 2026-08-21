@@ -89,6 +89,33 @@ class MosaicRecordsReaderTest {
     }
 
     @Test
+    void testConstructorIOExceptionClosesCreatedResources() throws IOException {
+        CloseCountingSeekableInputStream inputStream = new CloseCountingSeekableInputStream();
+        MosaicInputFileAdapter inputFileAdapter = createInputFileAdapter(inputStream);
+        CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+        IOException failure = new IOException("native reader failed");
+
+        assertThatThrownBy(
+                        () ->
+                                new MosaicRecordsReader(
+                                        inputFileAdapter,
+                                        0,
+                                        rowType(),
+                                        rowType(),
+                                        null,
+                                        new Path("file:/tmp/mosaic-reader-test"),
+                                        allocator,
+                                        (inputFile, fileSize, bufferAllocator) -> {
+                                            throw failure;
+                                        }))
+                .isInstanceOf(RuntimeException.class)
+                .hasCause(failure);
+
+        assertThat(allocator.closeCount()).isEqualTo(1);
+        assertThat(inputStream.closeCount()).isEqualTo(1);
+    }
+
+    @Test
     void testConstructorErrorClosesCreatedResources() throws IOException {
         CloseCountingSeekableInputStream inputStream = new CloseCountingSeekableInputStream();
         MosaicInputFileAdapter inputFileAdapter = createInputFileAdapter(inputStream);
