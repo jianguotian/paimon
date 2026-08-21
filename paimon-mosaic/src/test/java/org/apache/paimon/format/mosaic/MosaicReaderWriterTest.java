@@ -121,7 +121,8 @@ class MosaicReaderWriterTest {
         LocalFileIO fileIO = new LocalFileIO();
         try (RecordReader<InternalRow> reader =
                 readerFactory.createReader(
-                        new FormatReaderContext(fileIO, path, fileIO.getFileSize(path)))) {
+                        new FormatReaderContext(
+                                fileIO, path, fileIO.getFileSize(path), null, null))) {
             RecordReader.RecordIterator<InternalRow> batch = reader.readBatch();
             assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
             ArrowVectorizedRecordIterator arrowBatch = (ArrowVectorizedRecordIterator) batch;
@@ -191,7 +192,8 @@ class MosaicReaderWriterTest {
         FormatReaderFactory sourceReaderFactory =
                 sourceFormat.createReaderFactory(rowType, rowType, null);
         FormatReaderContext sourceContext =
-                new FormatReaderContext(fileIO, sourcePath, fileIO.getFileSize(sourcePath));
+                new FormatReaderContext(
+                        fileIO, sourcePath, fileIO.getFileSize(sourcePath), null, null);
         // Reader and writer factories own independent allocator roots. Mosaic consumes the
         // borrowed reader batch synchronously without moving its buffers to the writer root.
         try (DataFileRecordReader sourceReader =
@@ -300,7 +302,8 @@ class MosaicReaderWriterTest {
         FormatReaderFactory sourceReaderFactory =
                 format.createReaderFactory(sourceType, sourceType, null);
         FormatReaderContext sourceContext =
-                new FormatReaderContext(fileIO, sourcePath, fileIO.getFileSize(sourcePath));
+                new FormatReaderContext(
+                        fileIO, sourcePath, fileIO.getFileSize(sourcePath), null, null);
         try (DataFileRecordReader sourceReader =
                         new DataFileRecordReader(
                                 targetType,
@@ -359,7 +362,8 @@ class MosaicReaderWriterTest {
         FormatReaderFactory sourceReaderFactory =
                 format.createReaderFactory(sourceType, sourceType, null);
         FormatReaderContext sourceContext =
-                new FormatReaderContext(fileIO, sourcePath, fileIO.getFileSize(sourcePath));
+                new FormatReaderContext(
+                        fileIO, sourcePath, fileIO.getFileSize(sourcePath), null, null);
         CapturingMosaicWriterFactory targetWriterFactory =
                 new CapturingMosaicWriterFactory(format.createWriterFactory(targetType));
         LongCounter sequenceCounter = new LongCounter(5);
