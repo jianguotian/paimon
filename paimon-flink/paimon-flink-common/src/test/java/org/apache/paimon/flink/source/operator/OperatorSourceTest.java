@@ -23,6 +23,7 @@ import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.flink.source.SimpleSourceSplit;
 import org.apache.paimon.flink.utils.TestingMetricUtils;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.Table;
@@ -34,6 +35,10 @@ import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.DataTypes;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.connector.source.ReaderOutput;
+import org.apache.flink.api.connector.source.SourceOutput;
+import org.apache.flink.api.connector.source.SourceReader;
+import org.apache.flink.core.io.InputStatus;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.event.WatermarkEvent;
@@ -193,6 +198,71 @@ public class OperatorSourceTest {
             testHarnessCopy2.open();
             testReadSplit(operatorCopy2, () -> null, 3, 3, 3);
         }
+    }
+
+    @Test
+    public void testMonitorSourceLimitsSnapshotsUntilCheckpointCompletes() throws Exception {
+        MonitorSource source = new MonitorSource(table.newReadBuilder(), 10, false, false, 1);
+        SourceReader<Split, SimpleSourceSplit> reader = source.createReader(null);
+        TestingReaderOutput<Split> output = new TestingReaderOutput<>();
+
+        writeToTable(1, 1, 1);
+        assertThat(reader.pollNext(output)).isEqualTo(InputStatus.NOTHING_AVAILABLE);
+        assertThat(output.records).hasSize(1);
+
+        writeToTable(2, 2, 2);
+        assertThat(reader.isAvailable()).isNotDone();
+        assertThat(reader.pollNext(output)).isEqualTo(InputStatus.NOTHING_AVAILABLE);
+        assertThat(output.records).hasSize(1);
+
+        reader.snapshotState(1L);
+        reader.notifyCheckpointComplete(1L);
+
+        assertThat(reader.isAvailable()).isDone();
+        assertThat(reader.pollNext(output)).isEqualTo(InputStatus.NOTHING_AVAILABLE);
+        assertThat(output.records).hasSize(2);
+    }
+
+    @Test
+    public void testCheckpointBeforeSnapshotDoesNotReleaseSnapshotLimit() throws Exception {
+        MonitorSource source = new MonitorSource(table.newReadBuilder(), 10, false, false, 1);
+        SourceReader<Split, SimpleSourceSplit> reader = source.createReader(null);
+        TestingReaderOutput<Split> output = new TestingReaderOutput<>();
+
+        reader.snapshotState(1L);
+        writeToTable(1, 1, 1);
+        assertThat(reader.pollNext(output)).isEqualTo(InputStatus.NOTHING_AVAILABLE);
+
+        reader.notifyCheckpointComplete(1L);
+        assertThat(reader.isAvailable()).isNotDone();
+
+        reader.snapshotState(2L);
+        reader.notifyCheckpointComplete(2L);
+        assertThat(reader.isAvailable()).isDone();
+    }
+
+    @Test
+    public void testMonitorSourceSnapshotLimitIsOpenAfterRestore() throws Exception {
+        MonitorSource source = new MonitorSource(table.newReadBuilder(), 10, false, false, 1);
+        SourceReader<Split, SimpleSourceSplit> reader = source.createReader(null);
+
+        writeToTable(1, 1, 1);
+        assertThat(reader.pollNext(new TestingReaderOutput<>()))
+                .isEqualTo(InputStatus.NOTHING_AVAILABLE);
+        List<SimpleSourceSplit> checkpoint = reader.snapshotState(1L);
+
+        MonitorSource restoredSource =
+                new MonitorSource(table.newReadBuilder(), 10, false, false, 1);
+        SourceReader<Split, SimpleSourceSplit> restoredReader = restoredSource.createReader(null);
+        restoredReader.addSplits(checkpoint);
+        assertThat(restoredReader.isAvailable()).isDone();
+
+        writeToTable(2, 2, 2);
+        TestingReaderOutput<Split> output = new TestingReaderOutput<>();
+        assertThat(restoredReader.pollNext(output)).isEqualTo(InputStatus.NOTHING_AVAILABLE);
+        assertThat(output.records).hasSize(1);
+        assertThat(readSplit(output.records.get(0)))
+                .containsExactlyInAnyOrder(Arrays.asList(2, 2, 2));
     }
 
     @Test
@@ -378,5 +448,37 @@ public class OperatorSourceTest {
         assertThat(error[0]).isNull();
 
         return t;
+    }
+
+    private static class TestingReaderOutput<T> implements ReaderOutput<T> {
+
+        private final List<T> records = new ArrayList<>();
+
+        @Override
+        public void collect(T record) {
+            records.add(record);
+        }
+
+        @Override
+        public void collect(T record, long timestamp) {
+            collect(record);
+        }
+
+        @Override
+        public void emitWatermark(org.apache.flink.api.common.eventtime.Watermark watermark) {}
+
+        @Override
+        public void markIdle() {}
+
+        @Override
+        public void markActive() {}
+
+        @Override
+        public SourceOutput<T> createOutputForSplit(String splitId) {
+            return this;
+        }
+
+        @Override
+        public void releaseOutputForSplit(String splitId) {}
     }
 }

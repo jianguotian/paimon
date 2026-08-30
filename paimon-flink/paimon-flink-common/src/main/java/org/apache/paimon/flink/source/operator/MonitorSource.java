@@ -96,16 +96,27 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
     private final long monitorInterval;
     private final boolean emitSnapshotWatermark;
     private final boolean isBounded;
+    private final int maxSnapshotCount;
 
     public MonitorSource(
             ReadBuilder readBuilder,
             long monitorInterval,
             boolean emitSnapshotWatermark,
             boolean isBounded) {
+        this(readBuilder, monitorInterval, emitSnapshotWatermark, isBounded, -1);
+    }
+
+    public MonitorSource(
+            ReadBuilder readBuilder,
+            long monitorInterval,
+            boolean emitSnapshotWatermark,
+            boolean isBounded,
+            int maxSnapshotCount) {
         this.readBuilder = readBuilder;
         this.monitorInterval = monitorInterval;
         this.emitSnapshotWatermark = emitSnapshotWatermark;
         this.isBounded = isBounded;
+        this.maxSnapshotCount = maxSnapshotCount;
     }
 
     @Override
@@ -136,6 +147,9 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
                                         Long.parseLong(x.split(":")[0]),
                                         Long.parseLong(x.split(":")[1])));
         private final TreeMap<Long, Long> nextSnapshotPerCheckpoint = new TreeMap<>();
+        private final TreeMap<Long, Long> emittedSnapshotCountPerCheckpoint = new TreeMap<>();
+        private long emittedSnapshotCount;
+        private long completedSnapshotCount;
         private CompletableFuture<Void> availableFuture = CompletableFuture.completedFuture(null);
 
         @Override
@@ -145,6 +159,18 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             OptionalLong max = nextSnapshots.values().stream().mapToLong(Long::longValue).max();
             max.ifPresent(scan::notifyCheckpointComplete);
             nextSnapshots.clear();
+
+            boolean limitReached = snapshotLimitReached();
+            NavigableMap<Long, Long> emittedSnapshotCounts =
+                    emittedSnapshotCountPerCheckpoint.headMap(checkpointId, true);
+            OptionalLong completedCount =
+                    emittedSnapshotCounts.values().stream().mapToLong(Long::longValue).max();
+            completedCount.ifPresent(
+                    count -> completedSnapshotCount = Math.max(completedSnapshotCount, count));
+            emittedSnapshotCounts.clear();
+            if (limitReached && !snapshotLimitReached()) {
+                availableFuture.complete(null);
+            }
         }
 
         @Override
@@ -159,6 +185,7 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             List<Tuple2<Long, Long>> nextSnapshots = new ArrayList<>();
             this.nextSnapshotPerCheckpoint.forEach((k, v) -> nextSnapshots.add(new Tuple2<>(k, v)));
             this.nextSnapshotState.update(nextSnapshots);
+            this.emittedSnapshotCountPerCheckpoint.put(checkpointId, emittedSnapshotCount);
 
             if (LOG.isDebugEnabled()) {
                 LOG.debug("{} checkpoint {}.", getClass().getSimpleName(), nextSnapshot);
@@ -190,6 +217,11 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             for (Tuple2<Long, Long> tuple2 : nextSnapshotState.get()) {
                 nextSnapshotPerCheckpoint.put(tuple2.f0, tuple2.f1);
             }
+
+            emittedSnapshotCount = 0;
+            completedSnapshotCount = 0;
+            emittedSnapshotCountPerCheckpoint.clear();
+            availableFuture.complete(null);
         }
 
         @Override
@@ -199,11 +231,18 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
 
         @Override
         public InputStatus pollNext(ReaderOutput<Split> readerOutput) throws Exception {
+            if (snapshotLimitReached()) {
+                return InputStatus.NOTHING_AVAILABLE;
+            }
+
             boolean isEmpty;
             try {
                 List<Split> splits = isBounded ? batchScan.plan().splits() : scan.plan().splits();
                 isEmpty = splits.isEmpty();
                 splits.forEach(readerOutput::collect);
+                if (!isBounded && !isEmpty) {
+                    emittedSnapshotCount++;
+                }
 
                 if (emitSnapshotWatermark && !isBounded) {
                     Long watermark = scan.watermark();
@@ -231,7 +270,17 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
                                 });
                 return InputStatus.NOTHING_AVAILABLE;
             }
+            if (snapshotLimitReached()) {
+                availableFuture = new CompletableFuture<>();
+                return InputStatus.NOTHING_AVAILABLE;
+            }
             return InputStatus.MORE_AVAILABLE;
+        }
+
+        private boolean snapshotLimitReached() {
+            return !isBounded
+                    && maxSnapshotCount > 0
+                    && emittedSnapshotCount - completedSnapshotCount >= maxSnapshotCount;
         }
     }
 
@@ -307,8 +356,47 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             @Nullable Table table,
             RowType readType,
             boolean blobAsDescriptor) {
+        return buildSource(
+                env,
+                name,
+                typeInfo,
+                readBuilder,
+                monitorInterval,
+                emitSnapshotWatermark,
+                shuffleBucketWithPartition,
+                unordered,
+                nestedProjectedRowData,
+                isBounded,
+                limit,
+                table,
+                readType,
+                blobAsDescriptor,
+                -1);
+    }
+
+    public static DataStream<RowData> buildSource(
+            StreamExecutionEnvironment env,
+            String name,
+            TypeInformation<RowData> typeInfo,
+            ReadBuilder readBuilder,
+            long monitorInterval,
+            boolean emitSnapshotWatermark,
+            boolean shuffleBucketWithPartition,
+            boolean unordered,
+            NestedProjectedRowData nestedProjectedRowData,
+            boolean isBounded,
+            @Nullable Long limit,
+            @Nullable Table table,
+            RowType readType,
+            boolean blobAsDescriptor,
+            int maxSnapshotCount) {
         MonitorSource monitorSource =
-                new MonitorSource(readBuilder, monitorInterval, emitSnapshotWatermark, isBounded);
+                new MonitorSource(
+                        readBuilder,
+                        monitorInterval,
+                        emitSnapshotWatermark,
+                        isBounded,
+                        maxSnapshotCount);
         Source<Split, SimpleSourceSplit, NoOpEnumState> source = monitorSource;
         if (table != null) {
             source = new PaimonDataStreamSource<>(monitorSource, table);
