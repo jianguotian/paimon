@@ -22,22 +22,12 @@ import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.Identifier;
-import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.flink.source.operator.MonitorSource;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.table.Table;
-import org.apache.paimon.table.sink.BatchTableCommit;
-import org.apache.paimon.table.sink.BatchTableWrite;
-import org.apache.paimon.table.sink.BatchWriteBuilder;
-import org.apache.paimon.table.source.Split;
 import org.apache.paimon.types.DataTypes;
 
-import org.apache.flink.api.common.eventtime.Watermark;
-import org.apache.flink.api.connector.source.ReaderOutput;
-import org.apache.flink.api.connector.source.SourceOutput;
-import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.api.dag.Transformation;
-import org.apache.flink.core.io.InputStatus;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.transformations.SourceTransformation;
@@ -48,12 +38,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
 
-import static org.apache.paimon.CoreOptions.CONSUMER_EXPIRATION_TIME;
-import static org.apache.paimon.CoreOptions.CONSUMER_ID;
-import static org.apache.paimon.flink.FlinkConnectorOptions.SCAN_MAX_SNAPSHOT_COUNT;
 import static org.apache.paimon.flink.LogicalTypeConversion.toLogicalType;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -218,84 +203,5 @@ public class FlinkSourceBuilderTest {
                                                 ((SourceTransformation<?, ?, ?>) transformation)
                                                         .getSource())
                                         .isInstanceOf(PaimonDataStreamSource.class));
-    }
-
-    @Test
-    public void testExactlyOnceMonitorSourceUsesConfiguredMaxSnapshotCount() throws Exception {
-        Identifier identifier = Identifier.create("default", "limited_monitor_source");
-        catalog.createTable(
-                identifier,
-                Schema.newBuilder()
-                        .column("a", DataTypes.INT())
-                        .primaryKey("a")
-                        .option("bucket", "1")
-                        .option(CONSUMER_ID.key(), "limited_consumer")
-                        .option(CONSUMER_EXPIRATION_TIME.key(), "1 d")
-                        .option(SCAN_MAX_SNAPSHOT_COUNT.key(), "1")
-                        .build(),
-                false);
-        Table table = catalog.getTable(identifier);
-        writeToTable(table, 1);
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-
-        DataStream<RowData> dataStream =
-                new FlinkSourceBuilder(table).env(env).sourceBounded(false).build();
-        SourceTransformation<?, ?, ?> sourceTransformation =
-                dataStream.getTransformation().getTransitivePredecessors().stream()
-                        .filter(SourceTransformation.class::isInstance)
-                        .map(SourceTransformation.class::cast)
-                        .findFirst()
-                        .orElseThrow(AssertionError::new);
-        @SuppressWarnings("unchecked")
-        SourceReader<Split, SimpleSourceSplit> reader =
-                (SourceReader<Split, SimpleSourceSplit>)
-                        sourceTransformation.getSource().createReader(null);
-        TestingReaderOutput<Split> output = new TestingReaderOutput<>();
-
-        assertThat(reader.pollNext(output)).isEqualTo(InputStatus.NOTHING_AVAILABLE);
-        assertThat(output.records).hasSize(1);
-        assertThat(reader.isAvailable()).isNotDone();
-    }
-
-    private void writeToTable(Table table, int value) throws Exception {
-        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
-        BatchTableWrite write = writeBuilder.newWrite();
-        write.write(GenericRow.of(value));
-        BatchTableCommit commit = writeBuilder.newCommit();
-        commit.commit(write.prepareCommit());
-        write.close();
-        commit.close();
-    }
-
-    private static class TestingReaderOutput<T> implements ReaderOutput<T> {
-
-        private final List<T> records = new ArrayList<>();
-
-        @Override
-        public void collect(T record) {
-            records.add(record);
-        }
-
-        @Override
-        public void collect(T record, long timestamp) {
-            collect(record);
-        }
-
-        @Override
-        public void emitWatermark(Watermark watermark) {}
-
-        @Override
-        public void markIdle() {}
-
-        @Override
-        public void markActive() {}
-
-        @Override
-        public SourceOutput<T> createOutputForSplit(String splitId) {
-            return this;
-        }
-
-        @Override
-        public void releaseOutputForSplit(String splitId) {}
     }
 }

@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.source.operator;
 
+import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.flink.NestedProjectedRowData;
 import org.apache.paimon.flink.source.AbstractNonCoordinatedSource;
 import org.apache.paimon.flink.source.AbstractNonCoordinatedSourceReader;
@@ -26,6 +27,7 @@ import org.apache.paimon.flink.source.PaimonDataStreamSource;
 import org.apache.paimon.flink.source.SimpleSourceSplit;
 import org.apache.paimon.flink.source.SplitListState;
 import org.apache.paimon.flink.utils.JavaTypeInfo;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.ChannelComputer;
 import org.apache.paimon.table.source.DataSplit;
@@ -56,7 +58,9 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.NavigableMap;
 import java.util.OptionalLong;
@@ -106,7 +110,7 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
         this(readBuilder, monitorInterval, emitSnapshotWatermark, isBounded, -1);
     }
 
-    public MonitorSource(
+    MonitorSource(
             ReadBuilder readBuilder,
             long monitorInterval,
             boolean emitSnapshotWatermark,
@@ -147,9 +151,7 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
                                         Long.parseLong(x.split(":")[0]),
                                         Long.parseLong(x.split(":")[1])));
         private final TreeMap<Long, Long> nextSnapshotPerCheckpoint = new TreeMap<>();
-        private final TreeMap<Long, Long> emittedSnapshotCountPerCheckpoint = new TreeMap<>();
-        private long emittedSnapshotCount;
-        private long completedSnapshotCount;
+        private final Deque<Long> inFlightNextSnapshots = new ArrayDeque<>();
         private CompletableFuture<Void> availableFuture = CompletableFuture.completedFuture(null);
 
         @Override
@@ -157,17 +159,16 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             NavigableMap<Long, Long> nextSnapshots =
                     nextSnapshotPerCheckpoint.headMap(checkpointId, true);
             OptionalLong max = nextSnapshots.values().stream().mapToLong(Long::longValue).max();
-            max.ifPresent(scan::notifyCheckpointComplete);
-            nextSnapshots.clear();
-
             boolean limitReached = snapshotLimitReached();
-            NavigableMap<Long, Long> emittedSnapshotCounts =
-                    emittedSnapshotCountPerCheckpoint.headMap(checkpointId, true);
-            OptionalLong completedCount =
-                    emittedSnapshotCounts.values().stream().mapToLong(Long::longValue).max();
-            completedCount.ifPresent(
-                    count -> completedSnapshotCount = Math.max(completedSnapshotCount, count));
-            emittedSnapshotCounts.clear();
+            max.ifPresent(
+                    completedNextSnapshot -> {
+                        scan.notifyCheckpointComplete(completedNextSnapshot);
+                        while (!inFlightNextSnapshots.isEmpty()
+                                && inFlightNextSnapshots.getFirst() <= completedNextSnapshot) {
+                            inFlightNextSnapshots.removeFirst();
+                        }
+                    });
+            nextSnapshots.clear();
             if (limitReached && !snapshotLimitReached()) {
                 availableFuture.complete(null);
             }
@@ -185,7 +186,6 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             List<Tuple2<Long, Long>> nextSnapshots = new ArrayList<>();
             this.nextSnapshotPerCheckpoint.forEach((k, v) -> nextSnapshots.add(new Tuple2<>(k, v)));
             this.nextSnapshotState.update(nextSnapshots);
-            this.emittedSnapshotCountPerCheckpoint.put(checkpointId, emittedSnapshotCount);
 
             if (LOG.isDebugEnabled()) {
                 LOG.debug("{} checkpoint {}.", getClass().getSimpleName(), nextSnapshot);
@@ -217,10 +217,7 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             for (Tuple2<Long, Long> tuple2 : nextSnapshotState.get()) {
                 nextSnapshotPerCheckpoint.put(tuple2.f0, tuple2.f1);
             }
-
-            emittedSnapshotCount = 0;
-            completedSnapshotCount = 0;
-            emittedSnapshotCountPerCheckpoint.clear();
+            inFlightNextSnapshots.clear();
             availableFuture.complete(null);
         }
 
@@ -240,8 +237,10 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
                 List<Split> splits = isBounded ? batchScan.plan().splits() : scan.plan().splits();
                 isEmpty = splits.isEmpty();
                 splits.forEach(readerOutput::collect);
-                if (!isBounded && !isEmpty) {
-                    emittedSnapshotCount++;
+                if (!isBounded && maxSnapshotCount > 0 && !isEmpty) {
+                    inFlightNextSnapshots.addLast(
+                            Preconditions.checkNotNull(
+                                    scan.checkpoint(), "Non-empty streaming plan without state."));
                 }
 
                 if (emitSnapshotWatermark && !isBounded) {
@@ -280,7 +279,7 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
         private boolean snapshotLimitReached() {
             return !isBounded
                     && maxSnapshotCount > 0
-                    && emittedSnapshotCount - completedSnapshotCount >= maxSnapshotCount;
+                    && inFlightNextSnapshots.size() >= maxSnapshotCount;
         }
     }
 
@@ -356,40 +355,11 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
             @Nullable Table table,
             RowType readType,
             boolean blobAsDescriptor) {
-        return buildSource(
-                env,
-                name,
-                typeInfo,
-                readBuilder,
-                monitorInterval,
-                emitSnapshotWatermark,
-                shuffleBucketWithPartition,
-                unordered,
-                nestedProjectedRowData,
-                isBounded,
-                limit,
-                table,
-                readType,
-                blobAsDescriptor,
-                -1);
-    }
-
-    public static DataStream<RowData> buildSource(
-            StreamExecutionEnvironment env,
-            String name,
-            TypeInformation<RowData> typeInfo,
-            ReadBuilder readBuilder,
-            long monitorInterval,
-            boolean emitSnapshotWatermark,
-            boolean shuffleBucketWithPartition,
-            boolean unordered,
-            NestedProjectedRowData nestedProjectedRowData,
-            boolean isBounded,
-            @Nullable Long limit,
-            @Nullable Table table,
-            RowType readType,
-            boolean blobAsDescriptor,
-            int maxSnapshotCount) {
+        int maxSnapshotCount =
+                table == null
+                        ? -1
+                        : Options.fromMap(table.options())
+                                .get(FlinkConnectorOptions.SCAN_MAX_SNAPSHOT_COUNT);
         MonitorSource monitorSource =
                 new MonitorSource(
                         readBuilder,
