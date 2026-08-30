@@ -487,7 +487,8 @@ public class FlinkSourceBuilder {
                         limit,
                         table,
                         readBuilder.readType(),
-                        conf.get(CoreOptions.BLOB_AS_DESCRIPTOR));
+                        conf.get(CoreOptions.BLOB_AS_DESCRIPTOR),
+                        conf.get(FlinkConnectorOptions.SCAN_MAX_SNAPSHOT_COUNT));
         if (parallelism != null) {
             dataStream.getTransformation().setParallelism(parallelism);
         }
