@@ -772,6 +772,61 @@ class MosaicRecordsReaderTest {
     }
 
     @Test
+    void testIdentityIndexMappingKeepsArrowBundle() throws IOException {
+        CloseCountingSeekableInputStream inputStream = new CloseCountingSeekableInputStream();
+        MosaicInputFileAdapter inputFileAdapter = createInputFileAdapter(inputStream);
+        CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+        MosaicReader reader = mock(MosaicReader.class);
+        RowType rowType =
+                new RowType(Collections.singletonList(new DataField(0, "f0", DataTypes.INT())));
+        VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(rowType, allocator);
+        IntVector vector = (IntVector) root.getVector(0);
+        vector.allocateNew(1);
+        vector.setSafe(0, 42);
+        vector.setValueCount(1);
+        root.setRowCount(1);
+        when(reader.getSchema()).thenReturn(root.getSchema());
+        when(reader.numRowGroups()).thenReturn(1);
+        when(reader.rowGroupNumRows(0)).thenReturn(1);
+        when(reader.readRowGroup(0, allocator)).thenReturn(root);
+
+        Path filePath = new Path("file:/tmp/mosaic-reader-test");
+        MosaicRecordsReader recordsReader =
+                new MosaicRecordsReader(
+                        inputFileAdapter,
+                        0,
+                        rowType,
+                        rowType,
+                        null,
+                        filePath,
+                        allocator,
+                        (inputFile, fileSize, bufferAllocator) -> reader);
+        DataFileRecordReader dataFileReader =
+                new DataFileRecordReader(
+                        rowType,
+                        recordsReader,
+                        false,
+                        false,
+                        new int[] {0},
+                        null,
+                        null,
+                        false,
+                        null,
+                        0,
+                        Collections.emptyMap(),
+                        null,
+                        filePath);
+
+        FileRecordIterator<InternalRow> records = dataFileReader.readBatch();
+
+        assertThat(records).isInstanceOf(ArrowVectorizedRecordIterator.class);
+        assertThat(records.next().getInt(0)).isEqualTo(42);
+        records.releaseBatch();
+        dataFileReader.close();
+        assertThat(allocator.getAllocatedMemory()).isZero();
+    }
+
+    @Test
     void testReorderedTableColumnsFallBackFromArrowBundle() throws IOException {
         CloseCountingSeekableInputStream inputStream = new CloseCountingSeekableInputStream();
         MosaicInputFileAdapter inputFileAdapter = createInputFileAdapter(inputStream);

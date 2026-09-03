@@ -62,4 +62,59 @@ public class ColumnarRowIteratorTest {
             assertThat(rowIterator.returnedPosition()).isEqualTo(positions[rowIterator.index - 1]);
         }
     }
+
+    @Test
+    public void testIdentityMappingKeepsIterator() {
+        HeapIntVector heapIntVector = new HeapIntVector(1);
+        VectorizedColumnBatch vectorizedColumnBatch =
+                new VectorizedColumnBatch(new ColumnVector[] {heapIntVector});
+        vectorizedColumnBatch.setNumRows(1);
+        ColumnarRowIterator rowIterator =
+                new ColumnarRowIterator(
+                        new Path("test"), new ColumnarRow(vectorizedColumnBatch), null);
+        rowIterator.reset(0);
+
+        assertThat(rowIterator.mapping(null, new int[] {0})).isSameAs(rowIterator);
+    }
+
+    @Test
+    public void testNonIdentityMappingCopiesAndReordersIterator() {
+        HeapIntVector first = new HeapIntVector(1);
+        first.setInt(0, 1);
+        HeapIntVector second = new HeapIntVector(1);
+        second.setInt(0, 2);
+        VectorizedColumnBatch vectorizedColumnBatch =
+                new VectorizedColumnBatch(new ColumnVector[] {first, second});
+        vectorizedColumnBatch.setNumRows(1);
+        ColumnarRowIterator rowIterator =
+                new ColumnarRowIterator(
+                        new Path("test"), new ColumnarRow(vectorizedColumnBatch), null);
+        rowIterator.reset(0);
+
+        ColumnarRowIterator mapped = rowIterator.mapping(null, new int[] {1, 0});
+
+        assertThat(mapped).isNotSameAs(rowIterator);
+        assertThat(mapped.next().getInt(0)).isEqualTo(2);
+        assertThat(mapped.next()).isNull();
+    }
+
+    @Test
+    public void testIdentityPrefixMappingStillCopiesIterator() {
+        HeapIntVector first = new HeapIntVector(1);
+        first.setInt(0, 1);
+        HeapIntVector second = new HeapIntVector(1);
+        second.setInt(0, 2);
+        VectorizedColumnBatch vectorizedColumnBatch =
+                new VectorizedColumnBatch(new ColumnVector[] {first, second});
+        vectorizedColumnBatch.setNumRows(1);
+        ColumnarRowIterator rowIterator =
+                new ColumnarRowIterator(
+                        new Path("test"), new ColumnarRow(vectorizedColumnBatch), null);
+        rowIterator.reset(0);
+
+        ColumnarRowIterator mapped = rowIterator.mapping(null, new int[] {0});
+
+        assertThat(mapped).isNotSameAs(rowIterator);
+        assertThat(mapped.next().getFieldCount()).isEqualTo(1);
+    }
 }
