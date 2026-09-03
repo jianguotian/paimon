@@ -20,7 +20,12 @@ package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.columnar.ColumnVector;
+import org.apache.paimon.data.columnar.VectorizedColumnBatch;
+import org.apache.paimon.data.columnar.heap.HeapIntVector;
 import org.apache.paimon.format.FileFormatFactory;
+import org.apache.paimon.io.VectorizedBundleRecords;
 import org.apache.paimon.mosaic.MosaicWriter;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.types.DataField;
@@ -34,8 +39,10 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -101,6 +108,81 @@ class MosaicRecordsWriterTest {
         } finally {
             writer.close();
         }
+    }
+
+    @Test
+    void testVectorizedBundleUsesColumnBatchWrite() throws Exception {
+        RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
+        List<List<Integer>> snapshots = new ArrayList<>();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        doAnswer(
+                        invocation -> {
+                            VectorSchemaRoot root = invocation.getArgument(0);
+                            List<Integer> values = new ArrayList<>();
+                            IntVector vector = (IntVector) root.getVector("a");
+                            for (int i = 0; i < root.getRowCount(); i++) {
+                                values.add(vector.get(i));
+                            }
+                            snapshots.add(values);
+                            return null;
+                        })
+                .when(nativeWriter)
+                .write(any(VectorSchemaRoot.class));
+        MosaicRecordsWriter writer = createWriter(rowType, nativeWriter);
+
+        writer.addElement(GenericRow.of(1));
+        HeapIntVector vector = new HeapIntVector(2);
+        vector.setInt(0, 2);
+        vector.setInt(1, 3);
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+        batch.setNumRows(2);
+        writer.writeBundle(new VectorizedBundleRecords(batch, null));
+        writer.close();
+
+        assertThat(snapshots).containsExactly(List.of(1), List.of(2, 3));
+        assertThat(writer.genericBundleRows()).isZero();
+    }
+
+    @Test
+    void testVectorizedBundlePreservesSelectionAcrossBatches() throws Exception {
+        RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
+        List<List<Integer>> snapshots = new ArrayList<>();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        doAnswer(
+                        invocation -> {
+                            VectorSchemaRoot root = invocation.getArgument(0);
+                            List<Integer> values = new ArrayList<>();
+                            IntVector vector = (IntVector) root.getVector("a");
+                            for (int i = 0; i < root.getRowCount(); i++) {
+                                values.add(vector.get(i));
+                            }
+                            snapshots.add(values);
+                            return null;
+                        })
+                .when(nativeWriter)
+                .write(any(VectorSchemaRoot.class));
+        MosaicRecordsWriter writer = createWriter(rowType, nativeWriter);
+
+        int sourceRows = 2050;
+        HeapIntVector vector = new HeapIntVector(sourceRows);
+        int[] selected = new int[1025];
+        for (int i = 0; i < sourceRows; i++) {
+            vector.setInt(i, i);
+            if (i % 2 == 0) {
+                selected[i / 2] = i;
+            }
+        }
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+        batch.setNumRows(sourceRows);
+        writer.writeBundle(new VectorizedBundleRecords(batch, selected));
+        writer.close();
+
+        assertThat(snapshots).hasSize(2);
+        assertThat(snapshots.get(0)).hasSize(1024);
+        assertThat(snapshots.get(0).get(0)).isZero();
+        assertThat(snapshots.get(0).get(1023)).isEqualTo(2046);
+        assertThat(snapshots.get(1)).containsExactly(2048);
+        assertThat(writer.genericBundleRows()).isZero();
     }
 
     @Test

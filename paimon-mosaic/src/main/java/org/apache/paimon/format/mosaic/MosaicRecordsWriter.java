@@ -21,9 +21,11 @@ package org.apache.paimon.format.mosaic;
 import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.format.FileFormatFactory;
 import org.apache.paimon.io.BundleRecords;
+import org.apache.paimon.io.VectorizedBundleRecords;
 import org.apache.paimon.mosaic.ColumnStatistics;
 import org.apache.paimon.mosaic.MosaicWriter;
 import org.apache.paimon.mosaic.WriterOptions;
@@ -171,8 +173,29 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             return;
         }
 
+        if (bundleRecords instanceof VectorizedBundleRecords) {
+            writeVectorizedBundle((VectorizedBundleRecords) bundleRecords);
+            return;
+        }
+
         genericBundleRows += bundleRecords.rowCount();
         writeRows(bundleRecords);
+    }
+
+    private void writeVectorizedBundle(VectorizedBundleRecords records) {
+        flush();
+
+        VectorizedColumnBatch batch = records.batch();
+        int[] selected = records.selected();
+        int totalRows = selected == null ? batch.getNumRows() : selected.length;
+        int batchSize = arrowFormatWriter.getBatchSize();
+        int startIndex = 0;
+        while (startIndex < totalRows) {
+            int batchRows = Math.min(batchSize, totalRows - startIndex);
+            arrowFormatWriter.write(batch.columns, selected, startIndex, batchRows);
+            flush();
+            startIndex += batchRows;
+        }
     }
 
     private void writeRows(BundleRecords bundleRecords) {
