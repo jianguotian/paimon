@@ -23,10 +23,12 @@ import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
+import org.apache.paimon.data.columnar.heap.HeapBytesVector;
 import org.apache.paimon.data.columnar.heap.HeapIntVector;
 import org.apache.paimon.format.FileFormatFactory;
 import org.apache.paimon.io.VectorizedBundleRecords;
 import org.apache.paimon.mosaic.MosaicWriter;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
@@ -34,7 +36,9 @@ import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
 
@@ -43,14 +47,18 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.same;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /** Test for {@link MosaicRecordsWriter}. */
@@ -130,21 +138,24 @@ class MosaicRecordsWriterTest {
                 .write(any(VectorSchemaRoot.class));
         MosaicRecordsWriter writer = createWriter(rowType, nativeWriter);
 
-        writer.addElement(GenericRow.of(1));
-        HeapIntVector vector = new HeapIntVector(2);
-        vector.setInt(0, 2);
-        vector.setInt(1, 3);
-        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
-        batch.setNumRows(2);
-        writer.writeBundle(new VectorizedBundleRecords(batch, null));
-        writer.close();
+        try {
+            writer.addElement(GenericRow.of(1));
+            HeapIntVector vector = new HeapIntVector(2);
+            vector.setInt(0, 2);
+            vector.setInt(1, 3);
+            VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+            batch.setNumRows(2);
+            writer.writeBundle(new VectorizedBundleRecords(batch, null));
+        } finally {
+            writer.close();
+        }
 
-        assertThat(snapshots).containsExactly(List.of(1), List.of(2, 3));
+        assertThat(snapshots).containsExactly(Collections.singletonList(1), Arrays.asList(2, 3));
         assertThat(writer.genericBundleRows()).isZero();
     }
 
     @Test
-    void testVectorizedBundlePreservesSelectionAcrossBatches() throws Exception {
+    void testVectorizedBundlePreservesSelectionOrderAndDuplicatesAcrossBatches() throws Exception {
         RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
         List<List<Integer>> snapshots = new ArrayList<>();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
@@ -163,26 +174,141 @@ class MosaicRecordsWriterTest {
                 .write(any(VectorSchemaRoot.class));
         MosaicRecordsWriter writer = createWriter(rowType, nativeWriter);
 
-        int sourceRows = 2050;
-        HeapIntVector vector = new HeapIntVector(sourceRows);
-        int[] selected = new int[1025];
-        for (int i = 0; i < sourceRows; i++) {
-            vector.setInt(i, i);
-            if (i % 2 == 0) {
-                selected[i / 2] = i;
+        try {
+            int sourceRows = 2050;
+            HeapIntVector vector = new HeapIntVector(sourceRows);
+            int[] selected = new int[1025];
+            for (int i = 0; i < sourceRows; i++) {
+                vector.setInt(i, i);
             }
+            for (int i = 0; i < selected.length - 1; i++) {
+                selected[i] = sourceRows - 1 - i;
+            }
+            selected[selected.length - 1] = selected[0];
+            VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+            batch.setNumRows(sourceRows);
+            writer.writeBundle(new VectorizedBundleRecords(batch, selected));
+        } finally {
+            writer.close();
         }
-        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
-        batch.setNumRows(sourceRows);
-        writer.writeBundle(new VectorizedBundleRecords(batch, selected));
-        writer.close();
 
         assertThat(snapshots).hasSize(2);
         assertThat(snapshots.get(0)).hasSize(1024);
-        assertThat(snapshots.get(0).get(0)).isZero();
-        assertThat(snapshots.get(0).get(1023)).isEqualTo(2046);
-        assertThat(snapshots.get(1)).containsExactly(2048);
+        assertThat(snapshots.get(0).get(0)).isEqualTo(2049);
+        assertThat(snapshots.get(0).get(1023)).isEqualTo(1026);
+        assertThat(snapshots.get(1)).containsExactly(2049);
         assertThat(writer.genericBundleRows()).isZero();
+    }
+
+    @Test
+    void testVectorizedBundleRespectsWriteBatchMemory() throws Exception {
+        RowType rowType = RowType.builder().field("a", DataTypes.STRING()).build();
+        MemorySize memoryLimit = MemorySize.parse("64 kb");
+        FileFormatFactory.FormatContext formatContext =
+                new FileFormatFactory.FormatContext(new Options(), 1024, 1024, memoryLimit);
+        List<Integer> batchRowCounts = new ArrayList<>();
+        List<Long> batchBufferSizes = new ArrayList<>();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        doAnswer(
+                        invocation -> {
+                            VectorSchemaRoot root = invocation.getArgument(0);
+                            batchRowCounts.add(root.getRowCount());
+                            batchBufferSizes.add(
+                                    root.getFieldVectors().stream()
+                                            .mapToLong(FieldVector::getBufferSize)
+                                            .sum());
+                            return null;
+                        })
+                .when(nativeWriter)
+                .write(any(VectorSchemaRoot.class));
+        MosaicRecordsWriter writer = createWriter(rowType, nativeWriter, formatContext);
+
+        try {
+            int sourceRows = 128;
+            byte[] value = new byte[1024];
+            HeapBytesVector vector = new HeapBytesVector(sourceRows);
+            for (int i = 0; i < sourceRows; i++) {
+                vector.putByteArray(i, value, 0, value.length);
+            }
+            VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+            batch.setNumRows(sourceRows);
+            writer.writeBundle(new VectorizedBundleRecords(batch, null));
+        } finally {
+            writer.close();
+        }
+
+        assertThat(batchRowCounts).hasSizeGreaterThan(1);
+        assertThat(batchRowCounts).anyMatch(rows -> rows > 32);
+        assertThat(batchRowCounts.stream().mapToInt(Integer::intValue).sum()).isEqualTo(128);
+        assertThat(batchBufferSizes).allMatch(size -> size <= memoryLimit.getBytes());
+        assertThat(writer.genericBundleRows()).isZero();
+    }
+
+    @Test
+    void testVectorizedBundleRetriesWhenSampleUnderestimatesMemory() throws Exception {
+        RowType rowType = RowType.builder().field("a", DataTypes.STRING()).build();
+        MemorySize memoryLimit = MemorySize.parse("64 kb");
+        FileFormatFactory.FormatContext formatContext =
+                new FileFormatFactory.FormatContext(new Options(), 1024, 1024, memoryLimit);
+        List<Integer> writtenLengths = new ArrayList<>();
+        List<Long> allocatedMemory = new ArrayList<>();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        doAnswer(
+                        invocation -> {
+                            VectorSchemaRoot root = invocation.getArgument(0);
+                            VarCharVector vector = (VarCharVector) root.getVector("a");
+                            for (int i = 0; i < root.getRowCount(); i++) {
+                                writtenLengths.add(vector.get(i).length);
+                            }
+                            allocatedMemory.add(vector.getAllocator().getAllocatedMemory());
+                            return null;
+                        })
+                .when(nativeWriter)
+                .write(any(VectorSchemaRoot.class));
+        MosaicRecordsWriter writer = createWriter(rowType, nativeWriter, formatContext);
+
+        try {
+            int sourceRows = 64;
+            HeapBytesVector vector = new HeapBytesVector(sourceRows);
+            for (int i = 0; i < sourceRows; i++) {
+                int length = i < 32 ? 1 : 4096;
+                vector.putByteArray(i, new byte[length], 0, length);
+            }
+            VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+            batch.setNumRows(sourceRows);
+            writer.writeBundle(new VectorizedBundleRecords(batch, null));
+        } finally {
+            writer.close();
+        }
+
+        assertThat(writtenLengths)
+                .containsExactlyElementsOf(
+                        IntStream.range(0, 64)
+                                .map(i -> i < 32 ? 1 : 4096)
+                                .boxed()
+                                .collect(Collectors.toList()));
+        assertThat(allocatedMemory).allMatch(size -> size <= 2 * memoryLimit.getBytes());
+        assertThat(writer.genericBundleRows()).isZero();
+    }
+
+    @Test
+    void testNativeWriteFailureIsNotRetriedDuringClose() throws Exception {
+        RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
+        RuntimeException failure = new RuntimeException("native write failed");
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        doThrow(failure).when(nativeWriter).write(any(VectorSchemaRoot.class));
+        MosaicRecordsWriter writer = createWriter(rowType, nativeWriter);
+
+        HeapIntVector vector = new HeapIntVector(1);
+        vector.setInt(0, 1);
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+        batch.setNumRows(1);
+
+        assertThatThrownBy(() -> writer.writeBundle(new VectorizedBundleRecords(batch, null)))
+                .isSameAs(failure);
+        writer.close();
+
+        verify(nativeWriter, times(1)).write(any(VectorSchemaRoot.class));
     }
 
     @Test
@@ -533,10 +659,25 @@ class MosaicRecordsWriterTest {
 
     private static MosaicRecordsWriter createWriter(
             RowType rowType, MosaicWriter nativeWriter, BufferAllocator allocator) {
+        return createWriter(rowType, nativeWriter, FORMAT_CONTEXT, allocator);
+    }
+
+    private static MosaicRecordsWriter createWriter(
+            RowType rowType,
+            MosaicWriter nativeWriter,
+            FileFormatFactory.FormatContext formatContext) {
+        return createWriter(rowType, nativeWriter, formatContext, new RootAllocator());
+    }
+
+    private static MosaicRecordsWriter createWriter(
+            RowType rowType,
+            MosaicWriter nativeWriter,
+            FileFormatFactory.FormatContext formatContext,
+            BufferAllocator allocator) {
         return new MosaicRecordsWriter(
                 new ByteArrayOutputStream(),
                 rowType,
-                FORMAT_CONTEXT,
+                formatContext,
                 Collections.emptyList(),
                 null,
                 allocator,
