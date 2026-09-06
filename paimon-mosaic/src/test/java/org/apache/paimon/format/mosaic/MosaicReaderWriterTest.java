@@ -20,25 +20,41 @@ package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
+import org.apache.paimon.arrow.reader.ArrowVectorizedRecordIterator;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
-import org.apache.paimon.format.BundleFormatWriter;
+import org.apache.paimon.fileindex.FileIndexOptions;
 import org.apache.paimon.format.FileFormatFactory;
 import org.apache.paimon.format.FormatReaderContext;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.format.FormatWriterFactory;
+import org.apache.paimon.format.SimpleColStats;
+import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataFileRecordReader;
+import org.apache.paimon.io.FileWriterContext;
+import org.apache.paimon.io.RowDataFileWriter;
+import org.apache.paimon.io.SimpleStatsProducer;
+import org.apache.paimon.manifest.FileSource;
+import org.apache.paimon.mosaic.MosaicReader;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.reader.FileRecordIterator;
 import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.IndexCastMapping;
+import org.apache.paimon.schema.SchemaEvolutionUtil;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.LongCounter;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
@@ -50,7 +66,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
 
@@ -88,35 +103,324 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testPublicWriterFactoryFallsBackForCrossRootArrowBundle() throws IOException {
-        RowType rowType = RowType.builder().field("value", DataTypes.INT()).build();
+    void testExactSchemaReadExposesArrowBundle() throws IOException {
+        RowType rowType =
+                RowType.builder()
+                        .field("id", DataTypes.INT())
+                        .field("name", DataTypes.STRING())
+                        .build();
         Path path = newPath();
+        writeRows(
+                rowType,
+                path,
+                GenericRow.of(1, BinaryString.fromString("hello")),
+                GenericRow.of(2, BinaryString.fromString("world")));
+
         MosaicFileFormat format = createFormat();
-        FormatWriterFactory writerFactory = format.createWriterFactory(rowType);
+        FormatReaderFactory readerFactory = format.createReaderFactory(rowType, rowType, null);
+        LocalFileIO fileIO = new LocalFileIO();
+        try (RecordReader<InternalRow> reader =
+                readerFactory.createReader(
+                        new FormatReaderContext(
+                                fileIO, path, fileIO.getFileSize(path), null, null))) {
+            RecordReader.RecordIterator<InternalRow> batch = reader.readBatch();
+            assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+            ArrowVectorizedRecordIterator arrowBatch = (ArrowVectorizedRecordIterator) batch;
+            assertThat(arrowBatch.arrowBundle().rowCount()).isEqualTo(2);
+            assertThat(arrowBatch.arrowBundle().getVectorSchemaRoot().getSchema().getFields())
+                    .hasSize(2);
+            batch.releaseBatch();
+        }
+    }
+
+    @Test
+    void testCrossRootDataFileDirectArrowRewriteCombinesRowGroups() throws IOException {
+        RowType rowType =
+                RowType.builder()
+                        .field("id", DataTypes.INT())
+                        .field("name", DataTypes.STRING())
+                        .build();
+        Path sourcePath = newPath();
+        Path targetPath = newPath();
         LocalFileIO fileIO = new LocalFileIO();
 
-        try (RootAllocator sourceAllocator = new RootAllocator();
-                VectorSchemaRoot root =
-                        ArrowUtils.createVectorSchemaRoot(rowType, sourceAllocator);
-                BundleFormatWriter writer =
-                        (BundleFormatWriter)
-                                writerFactory.create(fileIO.newOutputStream(path, false), "zstd")) {
-            IntVector vector = (IntVector) root.getVector("value");
-            vector.allocateNew(2);
-            vector.setSafe(0, 7);
-            vector.setSafe(1, 9);
-            vector.setValueCount(2);
-            root.setRowCount(2);
+        MosaicFileFormat sourceFormat =
+                new MosaicFileFormat(
+                        new FileFormatFactory.FormatContext(
+                                new Options(),
+                                1024,
+                                2,
+                                MemorySize.VALUE_128_MB,
+                                1,
+                                MemorySize.parse("1 b")));
+        FormatWriter sourceWriter =
+                sourceFormat
+                        .createWriterFactory(rowType)
+                        .create(fileIO.newOutputStream(sourcePath, false), "zstd");
+        for (int i = 0; i < 6; i++) {
+            sourceWriter.addElement(GenericRow.of(i, BinaryString.fromString("value-" + i)));
+        }
+        sourceWriter.close();
 
-            CountingArrowBundleRecords bundle = new CountingArrowBundleRecords(root, rowType);
-            writer.writeBundle(bundle);
-            assertThat(bundle.iteratorCalls()).isEqualTo(1);
+        try (RootAllocator allocator = new RootAllocator();
+                MosaicInputFileAdapter input = new MosaicInputFileAdapter(fileIO, sourcePath);
+                MosaicReader sourceNativeReader =
+                        MosaicReader.open(input, fileIO.getFileSize(sourcePath), allocator)) {
+            assertThat(sourceNativeReader.numRowGroups()).isGreaterThan(1);
         }
 
-        List<InternalRow> result = readAll(rowType, rowType, path, null);
+        MosaicFileFormat targetFormat = createFormat();
+        CapturingMosaicWriterFactory targetWriterFactory =
+                new CapturingMosaicWriterFactory(targetFormat.createWriterFactory(rowType));
+        LongCounter sequenceCounter = new LongCounter(5);
+        RowDataFileWriter targetWriter =
+                new RowDataFileWriter(
+                        fileIO,
+                        new FileWriterContext(targetWriterFactory, disabledStatsProducer(), "zstd"),
+                        targetPath,
+                        rowType,
+                        1,
+                        () -> sequenceCounter,
+                        new FileIndexOptions(),
+                        FileSource.COMPACT,
+                        false,
+                        false,
+                        false,
+                        null,
+                        null,
+                        null);
+        FormatReaderFactory sourceReaderFactory =
+                sourceFormat.createReaderFactory(rowType, rowType, null);
+        FormatReaderContext sourceContext =
+                new FormatReaderContext(
+                        fileIO, sourcePath, fileIO.getFileSize(sourcePath), null, null);
+        // Reader and writer factories own independent allocator roots. Mosaic consumes the
+        // borrowed reader batch synchronously without moving its buffers to the writer root.
+        try (DataFileRecordReader sourceReader =
+                        new DataFileRecordReader(
+                                rowType,
+                                sourceReaderFactory,
+                                sourceContext,
+                                false,
+                                false,
+                                null,
+                                null,
+                                null,
+                                false,
+                                null,
+                                0,
+                                Collections.emptyMap());
+                RowDataFileWriter ignored = targetWriter) {
+            RecordReader.RecordIterator<InternalRow> batch;
+            while ((batch = sourceReader.readBatch()) != null) {
+                try {
+                    assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+                    ArrowBundleRecords bundle =
+                            ((ArrowVectorizedRecordIterator) batch).arrowBundle();
+                    assertThat(bundle).isInstanceOf(MosaicArrowBundleRecords.class);
+                    assertThat(bundle.hasIdentityMapping()).isTrue();
+                    targetWriter.writeBundle(bundle);
+                } finally {
+                    batch.releaseBatch();
+                }
+            }
+        }
+
+        DataFileMeta targetFile = targetWriter.result();
+        MosaicRecordsWriter mosaicWriter = targetWriterFactory.writer();
+        assertThat(targetWriter.recordCount()).isEqualTo(6);
+        assertThat(sequenceCounter.getValue()).isEqualTo(11);
+        assertThat(targetFile.rowCount()).isEqualTo(6);
+        assertThat(targetFile.minSequenceNumber()).isEqualTo(5);
+        assertThat(targetFile.maxSequenceNumber()).isEqualTo(10);
+        assertThat(mosaicWriter.directArrowRows()).isEqualTo(6);
+        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isZero();
+
+        List<InternalRow> result = readAll(rowType, rowType, targetPath, null);
+        assertThat(result).hasSize(6);
+        for (int i = 0; i < result.size(); i++) {
+            assertThat(result.get(i).getInt(0)).isEqualTo(i);
+            assertThat(result.get(i).getString(1).toString()).isEqualTo("value-" + i);
+        }
+
+        try (RootAllocator allocator = new RootAllocator();
+                MosaicInputFileAdapter input = new MosaicInputFileAdapter(fileIO, targetPath);
+                MosaicReader targetReader =
+                        MosaicReader.open(input, fileIO.getFileSize(targetPath), allocator)) {
+            assertThat(targetReader.numRowGroups()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void testExternalRootArrowBundleUsesDirectWrite() throws IOException {
+        RowType rowType = RowType.builder().field("id", DataTypes.INT()).build();
+        Path targetPath = newPath();
+        LocalFileIO fileIO = new LocalFileIO();
+        MosaicFileFormat targetFormat = createFormat();
+
+        try (FormatWriter formatWriter =
+                        targetFormat
+                                .createWriterFactory(rowType)
+                                .create(fileIO.newOutputStream(targetPath, false), "zstd");
+                RootAllocator sourceAllocator = new RootAllocator();
+                VectorSchemaRoot root =
+                        ArrowUtils.createVectorSchemaRoot(rowType, sourceAllocator)) {
+            MosaicRecordsWriter targetWriter = (MosaicRecordsWriter) formatWriter;
+            IntVector ids = (IntVector) root.getVector("id");
+            ids.allocateNew(1);
+            ids.setSafe(0, 42);
+            ids.setValueCount(1);
+            root.setRowCount(1);
+
+            targetWriter.writeBundle(new ArrowBundleRecords(root, rowType, true));
+
+            assertThat(targetWriter.directArrowRows()).isEqualTo(1);
+            assertThat(targetWriter.mosaicBundleFallbackRows()).isZero();
+        }
+
+        List<InternalRow> result = readAll(rowType, rowType, targetPath, null);
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getInt(0)).isEqualTo(42);
+    }
+
+    @Test
+    void testRenamedColumnRewriteFallsBackWithoutDataLoss() throws IOException {
+        RowType sourceType =
+                new RowType(
+                        Collections.singletonList(new DataField(7, "old_name", DataTypes.INT())));
+        RowType targetType =
+                new RowType(
+                        Collections.singletonList(new DataField(7, "new_name", DataTypes.INT())));
+        Path sourcePath = newPath();
+        Path targetPath = newPath();
+        LocalFileIO fileIO = new LocalFileIO();
+        writeRows(sourceType, sourcePath, GenericRow.of(42));
+
+        MosaicFileFormat format = createFormat();
+        FormatReaderFactory sourceReaderFactory =
+                format.createReaderFactory(sourceType, sourceType, null);
+        FormatReaderContext sourceContext =
+                new FormatReaderContext(
+                        fileIO, sourcePath, fileIO.getFileSize(sourcePath), null, null);
+        try (DataFileRecordReader sourceReader =
+                        new DataFileRecordReader(
+                                targetType,
+                                sourceReaderFactory,
+                                sourceContext,
+                                false,
+                                false,
+                                null,
+                                null,
+                                null,
+                                false,
+                                null,
+                                0,
+                                Collections.emptyMap());
+                FormatWriter formatWriter =
+                        format.createWriterFactory(targetType)
+                                .create(fileIO.newOutputStream(targetPath, false), "zstd")) {
+            MosaicRecordsWriter targetWriter = (MosaicRecordsWriter) formatWriter;
+            RecordReader.RecordIterator<InternalRow> batch = sourceReader.readBatch();
+            assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+            try {
+                targetWriter.writeBundle(((ArrowVectorizedRecordIterator) batch).arrowBundle());
+            } finally {
+                batch.releaseBatch();
+            }
+            assertThat(sourceReader.readBatch()).isNull();
+            assertThat(targetWriter.directArrowRows()).isZero();
+            assertThat(targetWriter.mosaicBundleFallbackRows()).isEqualTo(1);
+        }
+
+        List<InternalRow> result = readAll(targetType, targetType, targetPath, null);
+        assertThat(result).hasSize(1);
+        assertThat(result.get(0).getInt(0)).isEqualTo(42);
+    }
+
+    @Test
+    void testNotNullToNullableRewriteFallsBackWithoutDataLoss() throws IOException {
+        RowType sourceType =
+                new RowType(
+                        Collections.singletonList(
+                                new DataField(7, "value", DataTypes.INT().notNull())));
+        RowType targetType =
+                new RowType(Collections.singletonList(new DataField(7, "value", DataTypes.INT())));
+        Path sourcePath = newPath();
+        Path targetPath = newPath();
+        LocalFileIO fileIO = new LocalFileIO();
+        writeRows(sourceType, sourcePath, GenericRow.of(41), GenericRow.of(42));
+
+        IndexCastMapping mapping =
+                SchemaEvolutionUtil.createIndexCastMapping(
+                        targetType.getFields(), sourceType.getFields());
+        assertThat(mapping.getIndexMapping()).isNull();
+        assertThat(mapping.getCastMapping()).isNull();
+
+        MosaicFileFormat format = createFormat();
+        FormatReaderFactory sourceReaderFactory =
+                format.createReaderFactory(sourceType, sourceType, null);
+        FormatReaderContext sourceContext =
+                new FormatReaderContext(
+                        fileIO, sourcePath, fileIO.getFileSize(sourcePath), null, null);
+        CapturingMosaicWriterFactory targetWriterFactory =
+                new CapturingMosaicWriterFactory(format.createWriterFactory(targetType));
+        LongCounter sequenceCounter = new LongCounter(5);
+        RowDataFileWriter targetWriter =
+                new RowDataFileWriter(
+                        fileIO,
+                        new FileWriterContext(targetWriterFactory, disabledStatsProducer(), "zstd"),
+                        targetPath,
+                        targetType,
+                        1,
+                        () -> sequenceCounter,
+                        new FileIndexOptions(),
+                        FileSource.COMPACT,
+                        false,
+                        false,
+                        false,
+                        null,
+                        null,
+                        null);
+
+        try (DataFileRecordReader sourceReader =
+                        new DataFileRecordReader(
+                                targetType,
+                                sourceReaderFactory,
+                                sourceContext,
+                                false,
+                                false,
+                                mapping.getIndexMapping(),
+                                mapping.getCastMapping(),
+                                null,
+                                false,
+                                null,
+                                0,
+                                Collections.emptyMap());
+                RowDataFileWriter ignored = targetWriter) {
+            RecordReader.RecordIterator<InternalRow> batch = sourceReader.readBatch();
+            assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+            try {
+                targetWriter.writeBundle(((ArrowVectorizedRecordIterator) batch).arrowBundle());
+            } finally {
+                batch.releaseBatch();
+            }
+            assertThat(sourceReader.readBatch()).isNull();
+        }
+
+        DataFileMeta targetFile = targetWriter.result();
+        MosaicRecordsWriter mosaicWriter = targetWriterFactory.writer();
+        assertThat(targetWriter.recordCount()).isEqualTo(2);
+        assertThat(sequenceCounter.getValue()).isEqualTo(7);
+        assertThat(targetFile.rowCount()).isEqualTo(2);
+        assertThat(targetFile.minSequenceNumber()).isEqualTo(5);
+        assertThat(targetFile.maxSequenceNumber()).isEqualTo(6);
+        assertThat(mosaicWriter.directArrowRows()).isZero();
+        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isEqualTo(2);
+
+        List<InternalRow> result = readAll(targetType, targetType, targetPath, null);
         assertThat(result).hasSize(2);
-        assertThat(result.get(0).getInt(0)).isEqualTo(7);
-        assertThat(result.get(1).getInt(0)).isEqualTo(9);
+        assertThat(result.get(0).getInt(0)).isEqualTo(41);
+        assertThat(result.get(1).getInt(0)).isEqualTo(42);
     }
 
     @Test
@@ -391,31 +695,60 @@ class MosaicReaderWriterTest {
         return new MosaicFileFormat(new FileFormatFactory.FormatContext(options, 1024, 1024));
     }
 
+    private static SimpleStatsProducer disabledStatsProducer() {
+        return new SimpleStatsProducer() {
+
+            @Override
+            public boolean isStatsDisabled() {
+                return true;
+            }
+
+            @Override
+            public boolean requirePerRecord() {
+                return false;
+            }
+
+            @Override
+            public void collect(InternalRow row) {
+                throw new IllegalStateException();
+            }
+
+            @Override
+            public SimpleColStats[] extract(FileIO fileIO, Path path, long length) {
+                throw new IllegalStateException();
+            }
+        };
+    }
+
+    private static class CapturingMosaicWriterFactory implements FormatWriterFactory {
+
+        private final FormatWriterFactory delegate;
+        private MosaicRecordsWriter writer;
+
+        private CapturingMosaicWriterFactory(FormatWriterFactory delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public FormatWriter create(PositionOutputStream out, String compression)
+                throws IOException {
+            FormatWriter created = delegate.create(out, compression);
+            writer = (MosaicRecordsWriter) created;
+            return created;
+        }
+
+        private MosaicRecordsWriter writer() {
+            assertThat(writer).isNotNull();
+            return writer;
+        }
+    }
+
     private static boolean isNativeAvailable() {
         try {
             Class.forName("org.apache.paimon.mosaic.NativeLib");
             return true;
         } catch (Throwable t) {
             return false;
-        }
-    }
-
-    private static class CountingArrowBundleRecords extends ArrowBundleRecords {
-
-        private int iteratorCalls;
-
-        private CountingArrowBundleRecords(VectorSchemaRoot root, RowType rowType) {
-            super(root, rowType, true);
-        }
-
-        @Override
-        public Iterator<InternalRow> iterator() {
-            iteratorCalls++;
-            return super.iterator();
-        }
-
-        private int iteratorCalls() {
-            return iteratorCalls;
         }
     }
 }

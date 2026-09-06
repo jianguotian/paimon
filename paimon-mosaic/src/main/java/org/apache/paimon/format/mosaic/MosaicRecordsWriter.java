@@ -22,19 +22,26 @@ import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.columnar.ColumnVector;
+import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.format.FileFormatFactory;
 import org.apache.paimon.io.BundleRecords;
+import org.apache.paimon.io.VectorizedBundleRecords;
 import org.apache.paimon.mosaic.ColumnStatistics;
 import org.apache.paimon.mosaic.MosaicWriter;
 import org.apache.paimon.mosaic.WriterOptions;
 import org.apache.paimon.options.MemorySize;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypeRoot;
 import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.OversizedAllocationException;
 
 import javax.annotation.Nullable;
 
@@ -44,13 +51,27 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+
 /** Mosaic records writer. */
 public class MosaicRecordsWriter implements BundleFormatWriter {
+
+    private static final int MEMORY_CHECK_INTERVAL = 32;
 
     private final ArrowFormatWriter arrowFormatWriter;
     private final MosaicWriter nativeWriter;
     private final BufferAllocator allocator;
     private final List<String> statsColumnNames;
+    private final RowType rowType;
+    private final Schema arrowSchema;
+    private final long writeBatchMemory;
+    private final int initialVectorBatchRows;
+    @Nullable private RowType verifiedDirectRowType;
+    @Nullable private Schema verifiedDirectSchema;
+    private long directArrowRows;
+    private long mosaicBundleFallbackRows;
+    private long genericBundleRows;
+    private boolean failed;
     @Nullable private MosaicWriterMetadata metadata;
 
     public MosaicRecordsWriter(
@@ -78,10 +99,14 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             BufferAllocator allocator,
             NativeWriterFactory nativeWriterFactory) {
         this.statsColumnNames = statsColumnNames;
+        this.rowType = rowType;
         this.allocator = allocator;
 
         int writeBatchSize = formatContext.writeBatchSize();
         long writeBatchMemory = formatContext.writeBatchMemory().getBytes();
+        this.writeBatchMemory = writeBatchMemory;
+        this.initialVectorBatchRows =
+                initialVectorBatchRows(rowType, writeBatchSize, writeBatchMemory);
 
         WriterOptions options = new WriterOptions().zstdLevel(formatContext.zstdLevel());
         if (numBuckets != null) {
@@ -97,13 +122,19 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
 
         ArrowFormatWriter createdArrowWriter = null;
         MosaicWriter createdNativeWriter = null;
+        Schema createdArrowSchema;
         try {
+            checkArgument(
+                    writeBatchSize > 0,
+                    "'write.batch-size' must be greater than 0, but was %s.",
+                    writeBatchSize);
             createdArrowWriter =
                     ArrowFormatWriter.forBorrowedAllocator(
                             rowType, writeBatchSize, true, allocator, writeBatchMemory);
-            Schema arrowSchema = createdArrowWriter.getVectorSchemaRoot().getSchema();
+            createdArrowSchema = createdArrowWriter.getVectorSchemaRoot().getSchema();
             createdNativeWriter =
-                    nativeWriterFactory.create(outputStream, arrowSchema, options, allocator);
+                    nativeWriterFactory.create(
+                            outputStream, createdArrowSchema, options, allocator);
         } catch (Throwable t) {
             closeOnConstructionFailure(t, createdNativeWriter, createdArrowWriter, allocator);
             throw rethrowUnchecked(t);
@@ -111,10 +142,12 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
 
         this.arrowFormatWriter = createdArrowWriter;
         this.nativeWriter = createdNativeWriter;
+        this.arrowSchema = createdArrowSchema;
     }
 
     @Override
     public void addElement(InternalRow internalRow) {
+        checkNotFailed();
         if (!arrowFormatWriter.write(internalRow)) {
             flush();
             if (!arrowFormatWriter.write(internalRow)) {
@@ -125,19 +158,168 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
 
     @Override
     public void writeBundle(BundleRecords bundleRecords) {
+        checkNotFailed();
         if (bundleRecords instanceof ArrowBundleRecords) {
             ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
             VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
-            // Mosaic exports the borrowed vectors through the writer allocator, so direct writes
-            // require every source vector to share its root; otherwise preserve semantics via rows.
-            if (arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle)
-                    && ArrowUtils.hasSameRootAllocator(root, allocator)) {
-                flush();
-                nativeWriter.write(root);
+            RowType bundleRowType = arrowBundle.getRowType();
+            Schema bundleSchema = root.getSchema();
+            boolean trustedMosaicBundle = arrowBundle instanceof MosaicArrowBundleRecords;
+            boolean schemaCompatible =
+                    trustedMosaicBundle
+                            && bundleRowType == verifiedDirectRowType
+                            && bundleSchema.equals(verifiedDirectSchema);
+            if (!schemaCompatible) {
+                schemaCompatible =
+                        trustedMosaicBundle
+                                ? MosaicArrowSchemaCompatibility.matchesRowType(
+                                                rowType, bundleRowType)
+                                        && MosaicArrowSchemaCompatibility.matchesWriter(
+                                                arrowSchema, bundleSchema)
+                                : arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle);
+                if (schemaCompatible && trustedMosaicBundle) {
+                    verifiedDirectRowType = bundleRowType;
+                    verifiedDirectSchema = bundleSchema;
+                }
+            }
+            if (schemaCompatible && hasSingleInputAllocatorRoot(root)) {
+                writeDirectArrow(root, arrowBundle.rowCount());
                 return;
             }
+            if (trustedMosaicBundle) {
+                mosaicBundleFallbackRows += arrowBundle.rowCount();
+            } else {
+                genericBundleRows += arrowBundle.rowCount();
+            }
+            writeRows(arrowBundle);
+            return;
         }
 
+        if (bundleRecords instanceof VectorizedBundleRecords) {
+            writeVectorizedBundle((VectorizedBundleRecords) bundleRecords);
+            return;
+        }
+
+        genericBundleRows += bundleRecords.rowCount();
+        writeRows(bundleRecords);
+    }
+
+    private void writeVectorizedBundle(VectorizedBundleRecords records) {
+        flush();
+
+        VectorizedColumnBatch batch = records.batch();
+        int[] selected = records.selected();
+        int totalRows = selected == null ? batch.getNumRows() : selected.length;
+        int batchSize = arrowFormatWriter.getBatchSize();
+        int startIndex = 0;
+        while (startIndex < totalRows) {
+            int batchRows =
+                    prepareVectorizedBatch(
+                            batch.columns,
+                            selected,
+                            startIndex,
+                            Math.min(batchSize, totalRows - startIndex));
+            flush();
+            startIndex += batchRows;
+        }
+    }
+
+    private int prepareVectorizedBatch(
+            ColumnVector[] columns, @Nullable int[] selected, int startIndex, int maxBatchRows) {
+        // Variable-width data starts with the same 32-row memory-check granularity as row writes.
+        // A successful probe may grow before native consumption; an oversized candidate is cleared
+        // and retried so its buffers are not retained for the rest of the compaction.
+        int batchRows = Math.min(initialVectorBatchRows, maxBatchRows);
+        boolean mayExpand = true;
+        while (true) {
+            long memoryUsed;
+            try {
+                arrowFormatWriter.write(columns, selected, startIndex, batchRows);
+                memoryUsed = arrowFormatWriter.memoryUsed();
+            } catch (OutOfMemoryException | OversizedAllocationException e) {
+                clearArrowWriterForRetry();
+                if (batchRows == 1) {
+                    throw e;
+                }
+                batchRows = Math.max(1, batchRows / 2);
+                mayExpand = false;
+                continue;
+            }
+
+            if (memoryUsed > writeBatchMemory && batchRows > 1) {
+                clearArrowWriterForRetry();
+                batchRows = reducedBatchRows(batchRows, memoryUsed, writeBatchMemory);
+                mayExpand = false;
+                continue;
+            }
+
+            if (mayExpand) {
+                int expandedBatchRows =
+                        Math.min(
+                                maxBatchRows,
+                                rowsWithinMemory(batchRows, memoryUsed, writeBatchMemory));
+                if (expandedBatchRows > batchRows) {
+                    arrowFormatWriter.reset();
+                    batchRows = expandedBatchRows;
+                    continue;
+                }
+            }
+            return batchRows;
+        }
+    }
+
+    private void clearArrowWriterForRetry() {
+        arrowFormatWriter.reset();
+        arrowFormatWriter.getVectorSchemaRoot().clear();
+    }
+
+    private static int initialVectorBatchRows(
+            RowType rowType, int writeBatchSize, long writeBatchMemory) {
+        if (rowType.getFields().stream().anyMatch(field -> !isFixedWidth(field.type()))) {
+            return Math.min(writeBatchSize, MEMORY_CHECK_INTERVAL);
+        }
+
+        // Include one byte per field as a conservative allowance for validity buffers.
+        long estimatedBytesPerRow = (long) rowType.defaultSize() + rowType.getFieldCount();
+        return Math.min(
+                writeBatchSize,
+                rowsWithinMemory(1, Math.max(1, estimatedBytesPerRow), writeBatchMemory));
+    }
+
+    private static boolean isFixedWidth(DataType type) {
+        DataTypeRoot root = type.getTypeRoot();
+        switch (root) {
+            case BOOLEAN:
+            case DECIMAL:
+            case TINYINT:
+            case SMALLINT:
+            case INTEGER:
+            case BIGINT:
+            case FLOAT:
+            case DOUBLE:
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static int reducedBatchRows(int batchRows, long memoryUsed, long writeBatchMemory) {
+        return Math.min(batchRows - 1, rowsWithinMemory(batchRows, memoryUsed, writeBatchMemory));
+    }
+
+    private static int rowsWithinMemory(int batchRows, long memoryUsed, long writeBatchMemory) {
+        if (memoryUsed <= 0) {
+            return Integer.MAX_VALUE;
+        }
+        double estimatedRows = (double) writeBatchMemory * batchRows / memoryUsed;
+        return Math.max(1, (int) Math.min(Integer.MAX_VALUE, estimatedRows));
+    }
+
+    private void writeRows(BundleRecords bundleRecords) {
         for (InternalRow row : bundleRecords) {
             addElement(row);
         }
@@ -155,10 +337,12 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     public void close() throws IOException {
         Throwable throwable = null;
 
-        try {
-            flush();
-        } catch (Throwable t) {
-            throwable = t;
+        if (!failed) {
+            try {
+                flush();
+            } catch (Throwable t) {
+                throwable = t;
+            }
         }
 
         try {
@@ -205,13 +389,54 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         this.metadata = new MosaicWriterMetadata(numRowGroups, allStats, statsColumnNames);
     }
 
-    private void flush() {
-        arrowFormatWriter.flush();
-        if (!arrowFormatWriter.empty()) {
-            VectorSchemaRoot vsr = arrowFormatWriter.getVectorSchemaRoot();
-            nativeWriter.write(vsr);
+    private void writeDirectArrow(VectorSchemaRoot root, long rowCount) {
+        flush();
+        try {
+            nativeWriter.write(root);
+        } catch (RuntimeException | Error e) {
+            failed = true;
+            throw e;
         }
-        arrowFormatWriter.reset();
+        directArrowRows += rowCount;
+    }
+
+    private static boolean hasSingleInputAllocatorRoot(VectorSchemaRoot root) {
+        return !root.getFieldVectors().isEmpty()
+                && ArrowUtils.hasSameRootAllocator(root, root.getVector(0).getAllocator());
+    }
+
+    long directArrowRows() {
+        return directArrowRows;
+    }
+
+    long mosaicBundleFallbackRows() {
+        return mosaicBundleFallbackRows;
+    }
+
+    long genericBundleRows() {
+        return genericBundleRows;
+    }
+
+    private void flush() {
+        if (arrowFormatWriter.empty()) {
+            return;
+        }
+        arrowFormatWriter.flush();
+        VectorSchemaRoot vsr = arrowFormatWriter.getVectorSchemaRoot();
+        try {
+            nativeWriter.write(vsr);
+        } catch (RuntimeException | Error e) {
+            failed = true;
+            throw e;
+        } finally {
+            arrowFormatWriter.reset();
+        }
+    }
+
+    private void checkNotFailed() {
+        if (failed) {
+            throw new IllegalStateException("Mosaic writer has failed");
+        }
     }
 
     private static Throwable addSuppressed(Throwable throwable, Throwable suppressed) {
