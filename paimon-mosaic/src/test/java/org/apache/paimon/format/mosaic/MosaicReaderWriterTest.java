@@ -234,7 +234,7 @@ class MosaicReaderWriterTest {
         assertThat(targetFile.minSequenceNumber()).isEqualTo(5);
         assertThat(targetFile.maxSequenceNumber()).isEqualTo(10);
         assertThat(mosaicWriter.directArrowRows()).isEqualTo(6);
-        assertThat(mosaicWriter.schemaCompatibilityFallbackRows()).isZero();
+        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isZero();
 
         List<InternalRow> result = readAll(rowType, rowType, targetPath, null);
         assertThat(result).hasSize(6);
@@ -275,7 +275,7 @@ class MosaicReaderWriterTest {
             targetWriter.writeBundle(new ArrowBundleRecords(root, rowType, true));
 
             assertThat(targetWriter.directArrowRows()).isEqualTo(1);
-            assertThat(targetWriter.schemaCompatibilityFallbackRows()).isZero();
+            assertThat(targetWriter.mosaicBundleFallbackRows()).isZero();
         }
 
         List<InternalRow> result = readAll(rowType, rowType, targetPath, null);
@@ -329,7 +329,7 @@ class MosaicReaderWriterTest {
             }
             assertThat(sourceReader.readBatch()).isNull();
             assertThat(targetWriter.directArrowRows()).isZero();
-            assertThat(targetWriter.schemaCompatibilityFallbackRows()).isEqualTo(1);
+            assertThat(targetWriter.mosaicBundleFallbackRows()).isEqualTo(1);
         }
 
         List<InternalRow> result = readAll(targetType, targetType, targetPath, null);
@@ -415,7 +415,7 @@ class MosaicReaderWriterTest {
         assertThat(targetFile.minSequenceNumber()).isEqualTo(5);
         assertThat(targetFile.maxSequenceNumber()).isEqualTo(6);
         assertThat(mosaicWriter.directArrowRows()).isZero();
-        assertThat(mosaicWriter.schemaCompatibilityFallbackRows()).isEqualTo(2);
+        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isEqualTo(2);
 
         List<InternalRow> result = readAll(targetType, targetType, targetPath, null);
         assertThat(result).hasSize(2);

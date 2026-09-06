@@ -19,6 +19,7 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
+import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.columnar.ColumnVector;
@@ -50,6 +51,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+
 /** Mosaic records writer. */
 public class MosaicRecordsWriter implements BundleFormatWriter {
 
@@ -66,7 +69,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     @Nullable private RowType verifiedDirectRowType;
     @Nullable private Schema verifiedDirectSchema;
     private long directArrowRows;
-    private long schemaCompatibilityFallbackRows;
+    private long mosaicBundleFallbackRows;
     private long genericBundleRows;
     private boolean failed;
     @Nullable private MosaicWriterMetadata metadata;
@@ -121,6 +124,10 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         MosaicWriter createdNativeWriter = null;
         Schema createdArrowSchema;
         try {
+            checkArgument(
+                    writeBatchSize > 0,
+                    "'write.batch-size' must be greater than 0, but was %s.",
+                    writeBatchSize);
             createdArrowWriter =
                     ArrowFormatWriter.forBorrowedAllocator(
                             rowType, writeBatchSize, true, allocator, writeBatchMemory);
@@ -158,29 +165,29 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             RowType bundleRowType = arrowBundle.getRowType();
             Schema bundleSchema = root.getSchema();
             boolean trustedMosaicBundle = arrowBundle instanceof MosaicArrowBundleRecords;
-            boolean directCompatible =
+            boolean schemaCompatible =
                     trustedMosaicBundle
                             && bundleRowType == verifiedDirectRowType
                             && bundleSchema.equals(verifiedDirectSchema);
-            if (!directCompatible) {
-                directCompatible =
+            if (!schemaCompatible) {
+                schemaCompatible =
                         trustedMosaicBundle
                                 ? MosaicArrowSchemaCompatibility.matchesRowType(
                                                 rowType, bundleRowType)
                                         && MosaicArrowSchemaCompatibility.matchesWriter(
                                                 arrowSchema, bundleSchema)
                                 : arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle);
-                if (directCompatible && trustedMosaicBundle) {
+                if (schemaCompatible && trustedMosaicBundle) {
                     verifiedDirectRowType = bundleRowType;
                     verifiedDirectSchema = bundleSchema;
                 }
             }
-            if (directCompatible) {
+            if (schemaCompatible && hasSingleInputAllocatorRoot(root)) {
                 writeDirectArrow(root, arrowBundle.rowCount());
                 return;
             }
             if (trustedMosaicBundle) {
-                schemaCompatibilityFallbackRows += arrowBundle.rowCount();
+                mosaicBundleFallbackRows += arrowBundle.rowCount();
             } else {
                 genericBundleRows += arrowBundle.rowCount();
             }
@@ -393,12 +400,17 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         directArrowRows += rowCount;
     }
 
+    private static boolean hasSingleInputAllocatorRoot(VectorSchemaRoot root) {
+        return !root.getFieldVectors().isEmpty()
+                && ArrowUtils.hasSameRootAllocator(root, root.getVector(0).getAllocator());
+    }
+
     long directArrowRows() {
         return directArrowRows;
     }
 
-    long schemaCompatibilityFallbackRows() {
-        return schemaCompatibilityFallbackRows;
+    long mosaicBundleFallbackRows() {
+        return mosaicBundleFallbackRows;
     }
 
     long genericBundleRows() {

@@ -19,6 +19,7 @@
 package org.apache.paimon.arrow.reader;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
+import org.apache.paimon.reader.BundleRecordIterator;
 import org.apache.paimon.reader.VectorizedRecordIterator;
 
 /**
@@ -27,7 +28,13 @@ import org.apache.paimon.reader.VectorizedRecordIterator;
  * <p>Exposure does not guarantee a direct write. The concrete bundle writer still owns schema,
  * allocator, lifetime, and fallback decisions.
  */
-public interface ArrowVectorizedRecordIterator extends VectorizedRecordIterator {
+public interface ArrowVectorizedRecordIterator
+        extends VectorizedRecordIterator, BundleRecordIterator {
+
+    @Override
+    default ArrowBundleRecords bundleRecords() {
+        return arrowBundle();
+    }
 
     /**
      * Returns a borrowed view of the Arrow vectors backing {@link #batch()}.

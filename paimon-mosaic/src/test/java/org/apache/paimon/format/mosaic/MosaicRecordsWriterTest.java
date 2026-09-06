@@ -46,6 +46,8 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -97,6 +99,34 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
+    void testRejectsNonPositiveWriteBatchSize() {
+        RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
+
+        for (int writeBatchSize : new int[] {0, -1}) {
+            CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+            FileFormatFactory.FormatContext formatContext =
+                    new FileFormatFactory.FormatContext(new Options(), 1024, writeBatchSize);
+
+            assertThatThrownBy(
+                            () -> {
+                                try (MosaicRecordsWriter ignored =
+                                        createWriter(
+                                                rowType,
+                                                mock(MosaicWriter.class),
+                                                formatContext,
+                                                allocator)) {
+                                    throw new AssertionError(
+                                            "Accepted write batch size " + writeBatchSize);
+                                }
+                            })
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("write.batch-size")
+                    .hasMessageContaining("greater than 0");
+            assertThat(allocator.closeCount()).isEqualTo(1);
+        }
+    }
+
+    @Test
     void testCompatibleArrowBundleUsesDirectWrite() throws Exception {
         RowType rowType =
                 RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
@@ -118,7 +148,7 @@ class MosaicRecordsWriterTest {
 
             verify(nativeWriter).write(same(root));
             assertThat(writer.directArrowRows()).isEqualTo(1);
-            assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
+            assertThat(writer.mosaicBundleFallbackRows()).isZero();
         } finally {
             writer.close();
         }
@@ -442,7 +472,7 @@ class MosaicRecordsWriterTest {
 
             verify(nativeWriter).write(same(root));
             assertThat(writer.directArrowRows()).isEqualTo(1);
-            assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
+            assertThat(writer.mosaicBundleFallbackRows()).isZero();
             assertThat(writer.genericBundleRows()).isZero();
         } finally {
             writer.close();
@@ -467,7 +497,7 @@ class MosaicRecordsWriterTest {
 
             verify(nativeWriter).write(same(root));
             assertThat(writer.directArrowRows()).isEqualTo(1);
-            assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
+            assertThat(writer.mosaicBundleFallbackRows()).isZero();
             assertThat(writer.genericBundleRows()).isZero();
         } finally {
             writer.close();
@@ -475,7 +505,7 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
-    void testCompatibleMixedRootArrowBundleUsesDirectWrite() throws Exception {
+    void testMixedTopLevelRootMosaicBundleFallsBackToRows() throws Exception {
         RowType rowType =
                 RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
@@ -497,16 +527,39 @@ class MosaicRecordsWriterTest {
                 setInt(b, 20);
                 root.setRowCount(1);
 
-                writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
+                writer.writeBundle(new MosaicArrowBundleRecords(root, rowType));
 
-                verify(nativeWriter).write(same(root));
-                assertThat(writer.directArrowRows()).isEqualTo(1);
-                assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
-                assertThat(writer.genericBundleRows()).isZero();
+                verify(nativeWriter, never()).write(same(root));
+                assertThat(writer.directArrowRows()).isZero();
             }
         } finally {
             writer.close();
         }
+
+        verify(nativeWriter).write(any(VectorSchemaRoot.class));
+    }
+
+    @Test
+    void testMixedNestedRootMosaicBundleFallsBackToRows() throws Exception {
+        RowType nestedType = RowType.builder().field("value", DataTypes.INT()).build();
+        RowType rowType = RowType.builder().field("nested", nestedType).build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        MosaicRecordsWriter writer = createWriter(rowType, nativeWriter);
+
+        try (RootAllocator parentAllocator = new RootAllocator();
+                RootAllocator childAllocator = new RootAllocator();
+                VectorSchemaRoot root =
+                        nestedRoot(rowType.getFields().get(0), parentAllocator, childAllocator)) {
+            assertThat(parentAllocator.getRoot()).isNotSameAs(childAllocator.getRoot());
+            writer.writeBundle(new MosaicArrowBundleRecords(root, rowType));
+
+            verify(nativeWriter, never()).write(same(root));
+            assertThat(writer.directArrowRows()).isZero();
+        } finally {
+            writer.close();
+        }
+
+        verify(nativeWriter).write(any(VectorSchemaRoot.class));
     }
 
     @Test
@@ -560,7 +613,7 @@ class MosaicRecordsWriterTest {
 
             verify(nativeWriter).write(same(firstRoot));
             verify(nativeWriter, never()).write(same(secondRoot));
-            assertThat(writer.schemaCompatibilityFallbackRows()).isEqualTo(1);
+            assertThat(writer.mosaicBundleFallbackRows()).isEqualTo(1);
         } finally {
             writer.close();
         }
@@ -596,7 +649,7 @@ class MosaicRecordsWriterTest {
 
                 verify(nativeWriter, never()).write(same(root));
                 assertThat(writer.directArrowRows()).isZero();
-                assertThat(writer.schemaCompatibilityFallbackRows()).isEqualTo(1);
+                assertThat(writer.mosaicBundleFallbackRows()).isEqualTo(1);
             }
         } finally {
             writer.close();
@@ -636,7 +689,7 @@ class MosaicRecordsWriterTest {
 
                 verify(nativeWriter, never()).write(same(root));
                 assertThat(writer.directArrowRows()).isZero();
-                assertThat(writer.schemaCompatibilityFallbackRows()).isZero();
+                assertThat(writer.mosaicBundleFallbackRows()).isZero();
                 assertThat(writer.genericBundleRows()).isEqualTo(1);
             }
         } finally {
@@ -669,7 +722,7 @@ class MosaicRecordsWriterTest {
 
             writer.writeBundle(new MosaicArrowBundleRecords(root, bundleType));
             verify(nativeWriter, never()).write(same(root));
-            assertThat(writer.schemaCompatibilityFallbackRows()).isEqualTo(1);
+            assertThat(writer.mosaicBundleFallbackRows()).isEqualTo(1);
         } finally {
             writer.close();
         }
@@ -803,6 +856,24 @@ class MosaicRecordsWriterTest {
         vector.setValueCount(1);
     }
 
+    private static VectorSchemaRoot nestedRoot(
+            DataField field, BufferAllocator parentAllocator, BufferAllocator childAllocator) {
+        Field arrowField = ArrowUtils.toArrowField(field.name(), field.id(), field.type(), 0);
+        TestingStructVector structVector = new TestingStructVector(arrowField, parentAllocator);
+        IntVector childVector =
+                (IntVector) arrowField.getChildren().get(0).createVector(childAllocator);
+        structVector.putTestingChild(childVector);
+        structVector.allocateNew();
+        childVector.setSafe(0, 10);
+        childVector.setValueCount(1);
+        structVector.setIndexDefined(0);
+        structVector.setValueCount(1);
+        return new VectorSchemaRoot(
+                Collections.singletonList(structVector.getField()),
+                Collections.singletonList(structVector),
+                1);
+    }
+
     private static HeapIntVector heapInts(int... values) {
         HeapIntVector vector = new HeapIntVector(values.length);
         for (int i = 0; i < values.length; i++) {
@@ -831,6 +902,17 @@ class MosaicRecordsWriterTest {
 
         int closeCount() {
             return closeCount;
+        }
+    }
+
+    private static class TestingStructVector extends StructVector {
+
+        private TestingStructVector(Field field, BufferAllocator allocator) {
+            super(field.getName(), allocator, field.getFieldType(), null);
+        }
+
+        private void putTestingChild(FieldVector childVector) {
+            putChild(childVector.getName(), childVector);
         }
     }
 }

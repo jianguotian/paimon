@@ -24,6 +24,7 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.io.BundleRecords;
 import org.apache.paimon.io.DataFileRecordReader;
 import org.apache.paimon.mosaic.MosaicReader;
 import org.apache.paimon.reader.FileRecordIterator;
@@ -319,6 +320,9 @@ class MosaicRecordsReaderTest {
         assertThat(records).isInstanceOf(ArrowVectorizedRecordIterator.class);
         ArrowVectorizedRecordIterator arrowRecords = (ArrowVectorizedRecordIterator) records;
         assertThat(arrowRecords.arrowBundle().getVectorSchemaRoot()).isSameAs(root);
+        BundleRecords bundle = arrowRecords.bundleRecords();
+        assertThat(bundle).isInstanceOf(MosaicArrowBundleRecords.class);
+        assertThat(((MosaicArrowBundleRecords) bundle).getVectorSchemaRoot()).isSameAs(root);
         assertThat(arrowRecords.batch().getNumRows()).isEqualTo(3);
         assertThat(records.next().getInt(0)).isEqualTo(10);
         assertThat(records.returnedPosition()).isZero();
