@@ -79,6 +79,7 @@ import static org.apache.paimon.CoreOptions.CONSUMER_EXPIRATION_TIME;
 import static org.apache.paimon.CoreOptions.CONSUMER_ID;
 import static org.apache.paimon.flink.FlinkConnectorOptions.SCAN_MAX_SNAPSHOT_COUNT;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link MonitorSource} and {@link ReadOperator}. */
 public class OperatorSourceTest {
@@ -207,8 +208,20 @@ public class OperatorSourceTest {
     }
 
     @Test
+    public void testMonitorSourceSnapshotLimitRequiresCheckpointing() {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        assertThatThrownBy(
+                        () -> new FlinkSourceBuilder(table).env(env).sourceBounded(false).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(SCAN_MAX_SNAPSHOT_COUNT.key())
+                .hasMessageContaining("checkpoint");
+    }
+
+    @Test
     public void testMonitorSourceLimitsSnapshotsUntilCheckpointCompletes() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.enableCheckpointing(10);
         DataStream<RowData> dataStream =
                 new FlinkSourceBuilder(table).env(env).sourceBounded(false).build();
         SourceTransformation<?, ?, ?> sourceTransformation =

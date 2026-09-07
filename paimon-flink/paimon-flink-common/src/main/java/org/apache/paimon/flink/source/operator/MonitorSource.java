@@ -360,6 +360,12 @@ public class MonitorSource extends AbstractNonCoordinatedSource<Split> {
                         ? -1
                         : Options.fromMap(table.options())
                                 .get(FlinkConnectorOptions.SCAN_MAX_SNAPSHOT_COUNT);
+        Preconditions.checkArgument(
+                isBounded
+                        || maxSnapshotCount <= 0
+                        || env.getCheckpointConfig().isCheckpointingEnabled(),
+                "Option '%s' is only supported for streaming monitor source when checkpointing is enabled.",
+                FlinkConnectorOptions.SCAN_MAX_SNAPSHOT_COUNT.key());
         MonitorSource monitorSource =
                 new MonitorSource(
                         readBuilder,
