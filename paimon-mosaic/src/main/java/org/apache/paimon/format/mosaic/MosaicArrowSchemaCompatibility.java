@@ -96,14 +96,15 @@ final class MosaicArrowSchemaCompatibility {
         return actual != null
                 && expected.id() == actual.id()
                 && expected.name().equals(actual.name())
-                && expected.type().equals(actual.type());
+                && isNullabilityCompatible(expected.type().isNullable(), actual.type().isNullable())
+                && expected.type().equalsIgnoreNullable(actual.type());
     }
 
     private static boolean matchesField(
             Field expected, Field actual, boolean checkPresentMetadata) {
         if (!expected.getName().equals(actual.getName())
                 || !expected.getType().equals(actual.getType())
-                || expected.isNullable() != actual.isNullable()
+                || !isNullabilityCompatible(expected.isNullable(), actual.isNullable())
                 || !Objects.equals(
                         expected.getFieldType().getDictionary(),
                         actual.getFieldType().getDictionary())) {
@@ -134,5 +135,10 @@ final class MosaicArrowSchemaCompatibility {
             }
         }
         return true;
+    }
+
+    private static boolean isNullabilityCompatible(
+            boolean expectedNullable, boolean actualNullable) {
+        return expectedNullable || !actualNullable;
     }
 }

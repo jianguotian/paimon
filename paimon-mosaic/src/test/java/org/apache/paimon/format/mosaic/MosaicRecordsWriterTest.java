@@ -796,6 +796,34 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
+    void testMosaicBundleNullabilityNarrowingFallsBackToRows() throws Exception {
+        RowType writerType = RowType.builder().field("a", DataTypes.INT().notNull()).build();
+        RowType bundleType = RowType.builder().field("a", DataTypes.INT()).build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        MosaicRecordsWriter writer = createWriter(writerType, nativeWriter);
+        VectorSchemaRoot root;
+
+        try (RootAllocator sourceAllocator = new RootAllocator()) {
+            root = ArrowUtils.createVectorSchemaRoot(bundleType, sourceAllocator);
+            try (VectorSchemaRoot ignored = root) {
+                setInt((IntVector) root.getVector("a"), 10);
+                root.setRowCount(1);
+
+                writer.writeBundle(new MosaicArrowBundleRecords(root, bundleType));
+
+                verify(nativeWriter, never()).write(same(root));
+                assertThat(writer.directArrowRows()).isZero();
+                assertThat(writer.mosaicBundleFallbackRows()).isEqualTo(1);
+            }
+        } finally {
+            writer.close();
+        }
+
+        verify(nativeWriter).write(any(VectorSchemaRoot.class));
+        verify(nativeWriter, never()).write(same(root));
+    }
+
+    @Test
     void testArrowBundleFieldIdMismatchFallsBackToRows() throws Exception {
         RowType writerType =
                 new RowType(Collections.singletonList(new DataField(7, "a", DataTypes.INT())));

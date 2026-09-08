@@ -134,6 +134,61 @@ class MosaicReaderWriterTest {
     }
 
     @Test
+    void testNullableProjectionOverNotNullFileExposesArrowBundle() throws IOException {
+        RowType fileType =
+                new RowType(
+                        Collections.singletonList(
+                                new DataField(7, "value", DataTypes.INT().notNull())));
+        RowType projectedType =
+                new RowType(Collections.singletonList(new DataField(7, "value", DataTypes.INT())));
+        Path path = newPath();
+        writeRows(fileType, path, GenericRow.of(41), GenericRow.of(42));
+
+        MosaicFileFormat format = createFormat();
+        FormatReaderFactory readerFactory =
+                format.createReaderFactory(projectedType, projectedType, null);
+        LocalFileIO fileIO = new LocalFileIO();
+        try (RecordReader<InternalRow> reader =
+                readerFactory.createReader(
+                        new FormatReaderContext(
+                                fileIO, path, fileIO.getFileSize(path), null, null))) {
+            RecordReader.RecordIterator<InternalRow> batch = reader.readBatch();
+            assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+            assertThat(batch.next().getInt(0)).isEqualTo(41);
+            assertThat(batch.next().getInt(0)).isEqualTo(42);
+            assertThat(batch.next()).isNull();
+            batch.releaseBatch();
+        }
+    }
+
+    @Test
+    void testNotNullProjectionOverNullableFileFallsBackToRows() throws IOException {
+        RowType fileType =
+                new RowType(Collections.singletonList(new DataField(7, "value", DataTypes.INT())));
+        RowType projectedType =
+                new RowType(
+                        Collections.singletonList(
+                                new DataField(7, "value", DataTypes.INT().notNull())));
+        Path path = newPath();
+        writeRows(fileType, path, GenericRow.of(42));
+
+        MosaicFileFormat format = createFormat();
+        FormatReaderFactory readerFactory =
+                format.createReaderFactory(projectedType, projectedType, null);
+        LocalFileIO fileIO = new LocalFileIO();
+        try (RecordReader<InternalRow> reader =
+                readerFactory.createReader(
+                        new FormatReaderContext(
+                                fileIO, path, fileIO.getFileSize(path), null, null))) {
+            RecordReader.RecordIterator<InternalRow> batch = reader.readBatch();
+            assertThat(batch).isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+            assertThat(batch.next().getInt(0)).isEqualTo(42);
+            assertThat(batch.next()).isNull();
+            batch.releaseBatch();
+        }
+    }
+
+    @Test
     void testCrossRootDataFileDirectArrowRewriteCombinesRowGroups() throws IOException {
         RowType rowType =
                 RowType.builder()
@@ -338,7 +393,7 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testNotNullToNullableRewriteFallsBackWithoutDataLoss() throws IOException {
+    void testNotNullToNullableRewriteUsesDirectArrowWithoutDataLoss() throws IOException {
         RowType sourceType =
                 new RowType(
                         Collections.singletonList(
@@ -414,8 +469,8 @@ class MosaicReaderWriterTest {
         assertThat(targetFile.rowCount()).isEqualTo(2);
         assertThat(targetFile.minSequenceNumber()).isEqualTo(5);
         assertThat(targetFile.maxSequenceNumber()).isEqualTo(6);
-        assertThat(mosaicWriter.directArrowRows()).isZero();
-        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isEqualTo(2);
+        assertThat(mosaicWriter.directArrowRows()).isEqualTo(2);
+        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isZero();
 
         List<InternalRow> result = readAll(targetType, targetType, targetPath, null);
         assertThat(result).hasSize(2);
