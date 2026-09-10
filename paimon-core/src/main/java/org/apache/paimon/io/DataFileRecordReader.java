@@ -25,6 +25,7 @@ import org.apache.paimon.casting.FallbackMappingRow;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.PartitionInfo;
+import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.ColumnarRowIterator;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.fs.Path;
@@ -178,8 +179,20 @@ public class DataFileRecordReader implements FileRecordReader<InternalRow> {
         }
 
         if (iterator instanceof ColumnarRowIterator) {
-            iterator = ((ColumnarRowIterator) iterator).mapping(partitionInfo, indexMapping);
-            if (rowTrackingEnabled) {
+            ColumnarRowIterator sourceIterator = (ColumnarRowIterator) iterator;
+            iterator = sourceIterator.mapping(partitionInfo, indexMapping);
+            if (rowTrackingEnabled && !systemFields.isEmpty()) {
+                if (iterator == sourceIterator) {
+                    // Copy to a ColumnVector[] because cloning a subtype array preserves its
+                    // runtime type and cannot accept row-tracking wrapper vectors.
+                    ColumnarRowIterator columnarIterator = (ColumnarRowIterator) iterator;
+                    iterator =
+                            columnarIterator.copy(
+                                    Arrays.copyOf(
+                                            columnarIterator.batch().columns,
+                                            columnarIterator.batch().columns.length,
+                                            ColumnVector[].class));
+                }
                 iterator =
                         ((ColumnarRowIterator) iterator)
                                 .assignRowTracking(firstRowId, maxSequenceNumber, systemFields);
