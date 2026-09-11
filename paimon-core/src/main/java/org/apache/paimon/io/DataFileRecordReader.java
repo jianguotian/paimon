@@ -25,6 +25,7 @@ import org.apache.paimon.casting.FallbackMappingRow;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.PartitionInfo;
+import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.ColumnarRowIterator;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.fs.Path;
@@ -178,8 +179,26 @@ public class DataFileRecordReader implements FileRecordReader<InternalRow> {
         }
 
         if (iterator instanceof ColumnarRowIterator) {
-            iterator = ((ColumnarRowIterator) iterator).mapping(partitionInfo, indexMapping);
-            if (rowTrackingEnabled) {
+            ColumnarRowIterator sourceIterator = (ColumnarRowIterator) iterator;
+            iterator = sourceIterator.mapping(partitionInfo, indexMapping);
+            boolean assignRowTracking =
+                    rowTrackingEnabled
+                            && (systemFields.containsKey(SpecialFields.SEQUENCE_NUMBER.name())
+                                    || (firstRowId != null
+                                            && systemFields.containsKey(
+                                                    SpecialFields.ROW_ID.name())));
+            if (assignRowTracking) {
+                if (iterator == sourceIterator) {
+                    // Row tracking replaces columns in place. Copy to the base array type so
+                    // reader-owned and covariant column arrays remain untouched.
+                    ColumnarRowIterator columnarIterator = (ColumnarRowIterator) iterator;
+                    iterator =
+                            columnarIterator.copy(
+                                    Arrays.copyOf(
+                                            columnarIterator.batch().columns,
+                                            columnarIterator.batch().columns.length,
+                                            ColumnVector[].class));
+                }
                 iterator =
                         ((ColumnarRowIterator) iterator)
                                 .assignRowTracking(firstRowId, maxSequenceNumber, systemFields);

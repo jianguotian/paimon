@@ -47,7 +47,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -786,6 +788,63 @@ public class ArrowBundleWriterTest {
         assertThat(nativeWriter.snapshots).hasSize(2);
         assertThat(nativeWriter.snapshots.get(0).rowCount).isEqualTo(2);
         assertThat(nativeWriter.snapshots.get(1).rowCount).isEqualTo(2);
+    }
+
+    @Test
+    public void testUnselectedArrayAndMapBulkWritesUseLogicalOffsets() throws IOException {
+        RowType rowType =
+                RowType.of(
+                        DataTypes.ARRAY(DataTypes.INT()),
+                        DataTypes.MAP(DataTypes.INT(), DataTypes.INT()));
+        ArrowFormatCWriter cWriter = new ArrowFormatCWriter(rowType, 1024, true);
+        CapturingNativeWriter nativeWriter =
+                new CapturingNativeWriter(cWriter.getVectorSchemaRoot(), cWriter);
+        ArrowBundleWriter writer =
+                new ArrowBundleWriter(new NoOpPositionOutputStream(), cWriter, nativeWriter);
+
+        HeapIntVector elements = new HeapIntVector(6);
+        for (int i = 0; i < 6; i++) {
+            elements.setInt(i, 900 + i);
+        }
+        elements.setInt(2, 10);
+        elements.setInt(5, 20);
+        HeapArrayVector arrays = new HeapArrayVector(2, elements);
+        arrays.putOffsetLength(0, 2, 1);
+        arrays.putOffsetLength(1, 5, 1);
+
+        HeapIntVector keys = new HeapIntVector(5);
+        HeapIntVector values = new HeapIntVector(5);
+        for (int i = 0; i < 5; i++) {
+            keys.setInt(i, 90 + i);
+            values.setInt(i, 900 + i);
+        }
+        keys.setInt(1, 1);
+        keys.setInt(4, 2);
+        values.setInt(1, 10);
+        values.setInt(4, 20);
+        HeapMapVector maps = new HeapMapVector(2, keys, values);
+        maps.putOffsetLength(0, 1, 1);
+        maps.putOffsetLength(1, 4, 1);
+
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {arrays, maps});
+        batch.setNumRows(2);
+        writer.add(batch, null);
+        writer.close();
+
+        assertThat(nativeWriter.snapshots).hasSize(1);
+        CapturingNativeWriter.Snapshot snapshot = nativeWriter.snapshots.get(0);
+        assertThat(snapshot.objectColumns.get(0))
+                .containsExactly(Collections.singletonList(10), Collections.singletonList(20));
+        Map<String, Integer> firstMapEntry = new HashMap<>();
+        firstMapEntry.put("key", 1);
+        firstMapEntry.put("value", 10);
+        Map<String, Integer> secondMapEntry = new HashMap<>();
+        secondMapEntry.put("key", 2);
+        secondMapEntry.put("value", 20);
+        assertThat(snapshot.objectColumns.get(1))
+                .containsExactly(
+                        Collections.singletonList(firstMapEntry),
+                        Collections.singletonList(secondMapEntry));
     }
 
     @Test
