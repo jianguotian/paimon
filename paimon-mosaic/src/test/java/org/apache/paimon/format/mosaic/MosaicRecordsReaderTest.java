@@ -518,7 +518,7 @@ class MosaicRecordsReaderTest {
                         recordsReader,
                         false,
                         false,
-                        null,
+                        new int[] {0, 1, 2},
                         null,
                         null,
                         true,
@@ -539,6 +539,72 @@ class MosaicRecordsReaderTest {
 
         tracked.releaseBatch();
         dataFileReader.close();
+    }
+
+    @Test
+    void testStoredRowIdIdentityMappingKeepsArrowBundle() throws IOException {
+        CloseCountingSeekableInputStream inputStream = new CloseCountingSeekableInputStream();
+        MosaicInputFileAdapter inputFileAdapter = createInputFileAdapter(inputStream);
+        CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+        MosaicReader reader = mock(MosaicReader.class);
+        RowType rowType =
+                RowType.builder()
+                        .field("id", DataTypes.INT())
+                        .field(SpecialFields.ROW_ID.name(), DataTypes.BIGINT())
+                        .build();
+        VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(rowType, allocator);
+        IntVector idVector = (IntVector) root.getVector(0);
+        idVector.allocateNew(1);
+        idVector.setSafe(0, 7);
+        idVector.setValueCount(1);
+        BigIntVector rowIdVector = (BigIntVector) root.getVector(1);
+        rowIdVector.allocateNew(1);
+        rowIdVector.setSafe(0, 123L);
+        rowIdVector.setValueCount(1);
+        root.setRowCount(1);
+        when(reader.getSchema()).thenReturn(root.getSchema());
+        when(reader.numRowGroups()).thenReturn(1);
+        when(reader.rowGroupNumRows(0)).thenReturn(1);
+        when(reader.readRowGroup(0, allocator)).thenReturn(root);
+
+        Path filePath = new Path("file:/tmp/mosaic-reader-test");
+        MosaicRecordsReader recordsReader =
+                new MosaicRecordsReader(
+                        inputFileAdapter,
+                        0,
+                        rowType,
+                        rowType,
+                        null,
+                        filePath,
+                        allocator,
+                        (inputFile, fileSize, bufferAllocator) -> reader);
+        DataFileRecordReader dataFileReader =
+                new DataFileRecordReader(
+                        rowType,
+                        recordsReader,
+                        false,
+                        false,
+                        new int[] {0, 1},
+                        null,
+                        null,
+                        true,
+                        null,
+                        7L,
+                        Collections.singletonMap(SpecialFields.ROW_ID.name(), 1),
+                        null,
+                        filePath);
+
+        FileRecordIterator<InternalRow> records = dataFileReader.readBatch();
+
+        assertThat(records).isInstanceOf(ArrowVectorizedRecordIterator.class);
+        assertThat(((ArrowVectorizedRecordIterator) records).arrowBundle().getVectorSchemaRoot())
+                .isSameAs(root);
+        InternalRow row = records.next();
+        assertThat(row.getInt(0)).isEqualTo(7);
+        assertThat(row.getLong(1)).isEqualTo(123L);
+        records.releaseBatch();
+        dataFileReader.close();
+        assertThat(allocator.getAllocatedMemory()).isZero();
     }
 
     @Test
