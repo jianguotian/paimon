@@ -132,6 +132,7 @@ class CoreOptions:
         "data-evolution.enabled",
         "index-file-in-data-file-dir",
         "blob-field",
+        "video-frame-field",
         "blob-descriptor-field",
         "blob-view-field",
         "pk-clustering-override",
@@ -142,6 +143,7 @@ class CoreOptions:
     FILE_FORMAT_AVRO: str = "avro"
     FILE_FORMAT_PARQUET: str = "parquet"
     FILE_FORMAT_BLOB: str = "blob"
+    FILE_FORMAT_VIDEO: str = "video"
     FILE_FORMAT_LANCE: str = "lance"
     FILE_FORMAT_VORTEX: str = "vortex"
     FILE_FORMAT_ROW: str = "row"
@@ -278,6 +280,16 @@ class CoreOptions:
         )
     )
 
+    WRITE_ONLY: ConfigOption[bool] = (
+        ConfigOptions.key("write-only")
+        .boolean_type()
+        .default_value(False)
+        .with_description(
+            "Whether to use write-only mode. Automatic manifest merging is skipped "
+            "when both this option and manifest.merge.skip-on-write-only are true."
+        )
+    )
+
     SCAN_MANIFEST_PARALLELISM: ConfigOption[int] = (
         ConfigOptions.key("scan.manifest.parallelism")
         .int_type()
@@ -297,6 +309,16 @@ class CoreOptions:
         .memory_type()
         .default_value(MemorySize.of_mebi_bytes(8))
         .with_description("Suggested file size of a manifest file.")
+    )
+
+    MANIFEST_MERGE_SKIP_ON_WRITE_ONLY: ConfigOption[bool] = (
+        ConfigOptions.key("manifest.merge.skip-on-write-only")
+        .boolean_type()
+        .default_value(False)
+        .with_description(
+            "Whether to skip automatic manifest merging during commit when write-only is true. "
+            "Python only supports minor manifest compaction, without manifest sort rewrite."
+        )
     )
 
     MANIFEST_MERGE_MIN_COUNT: ConfigOption[int] = (
@@ -397,6 +419,18 @@ class CoreOptions:
         .string_type()
         .no_default_value()
         .with_description("Comma-separated column names that should be stored as blob type.")
+    )
+
+    VIDEO_FRAME_FIELD: ConfigOption[str] = (
+        ConfigOptions.key("video-frame-field")
+        .string_type()
+        .no_default_value()
+        .with_description(
+            "Comma-separated scalar BLOB fields whose logical values are "
+            "frames in encoded videos packed into '.video' files. Payload "
+            "boundaries may be nested across fields, but every change must "
+            "occur at a logical episode boundary."
+        )
     )
 
     BLOB_DESCRIPTOR_FIELD: ConfigOption[str] = (
@@ -719,6 +753,18 @@ class CoreOptions:
         .boolean_type()
         .default_value(False)
         .with_description("Whether to enable data evolution.")
+    )
+
+    DATA_EVOLUTION_WRITE_COLS_OPTIMIZATION_ENABLED: ConfigOption[bool] = (
+        ConfigOptions.key("data-evolution.write-cols-optimization.enabled")
+        .boolean_type()
+        .default_value(False)
+        .with_description(
+            "Whether to omit write columns from data file metadata when a "
+            "data evolution file contains all non-dedicated columns. Readers "
+            "always support the omitted metadata, but writing it is disabled "
+            "by default for compatibility with older readers."
+        )
     )
 
     DATA_EVOLUTION_ROW_ID_CONFLICT_REWRITE_MAX_SIZE: ConfigOption[MemorySize] = (
@@ -1162,6 +1208,9 @@ class CoreOptions:
             CoreOptions.POSTPONE_TARGET_SIZE_PER_BUCKET, default
         ).get_bytes()
 
+    def write_only(self, default=None):
+        return self.options.get(CoreOptions.WRITE_ONLY, default)
+
     def scan_manifest_parallelism(self, default=None):
         return self.options.get(CoreOptions.SCAN_MANIFEST_PARALLELISM, default)
 
@@ -1172,6 +1221,9 @@ class CoreOptions:
         if default is not None and not isinstance(default, MemorySize):
             default = MemorySize.of_bytes(default) if isinstance(default, int) else MemorySize.parse(default)
         return self.options.get(CoreOptions.MANIFEST_TARGET_FILE_SIZE, default).get_bytes()
+
+    def manifest_merge_skip_on_write_only(self, default=None):
+        return self.options.get(CoreOptions.MANIFEST_MERGE_SKIP_ON_WRITE_ONLY, default)
 
     def manifest_merge_min_count(self, default=None):
         return self.options.get(CoreOptions.MANIFEST_MERGE_MIN_COUNT, default)
@@ -1224,6 +1276,14 @@ class CoreOptions:
         return val
 
     def blob_descriptor_fields(self, default=None):
+        # Do not treat blob.stored-descriptor-fields as a layout switch.
+        # Python master ignored that key and wrote dedicated .blob payloads;
+        # a global fallback would mis-parse those files during a rolling
+        # upgrade. The cost is that Java tables which only set the fallback
+        # key store inline descriptors, and Python returns those bytes
+        # instead of fetching payload. Migrate explicitly to
+        # blob-descriptor-field (column directives already copy the legacy
+        # key onto the canonical option).
         value = self.options.get(CoreOptions.BLOB_DESCRIPTOR_FIELD, default)
         return CoreOptions._parse_field_set(value)
 
@@ -1233,6 +1293,19 @@ class CoreOptions:
 
     def blob_field(self, default=None):
         value = self.options.get(CoreOptions.BLOB_FIELD, default)
+        return CoreOptions._parse_field_set(value)
+
+    def video_frame_field(self, default=None) -> Optional[str]:
+        fields = self.video_frame_fields(default)
+        if len(fields) > 1:
+            raise ValueError(
+                "'video-frame-field' configures multiple fields "
+                f"{sorted(fields)}; use video_frame_fields()."
+            )
+        return next(iter(fields)) if fields else None
+
+    def video_frame_fields(self, default=None):
+        value = self.options.get(CoreOptions.VIDEO_FRAME_FIELD, default)
         return CoreOptions._parse_field_set(value)
 
     def blob_view_resolve_enabled(self, default=True):
@@ -1372,6 +1445,12 @@ class CoreOptions:
 
     def data_evolution_enabled(self, default=None):
         return self.options.get(CoreOptions.DATA_EVOLUTION_ENABLED, default)
+
+    def data_evolution_write_cols_optimization_enabled(self, default=None):
+        return self.options.get(
+            CoreOptions.DATA_EVOLUTION_WRITE_COLS_OPTIMIZATION_ENABLED,
+            default,
+        )
 
     def data_evolution_row_id_conflict_rewrite_max_size(self, default=None):
         value = self.options.get(

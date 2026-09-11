@@ -18,6 +18,7 @@
 
 import logging
 import re
+import sys
 from typing import Mapping, Optional, Set
 
 import pyarrow as pa
@@ -32,14 +33,17 @@ logger = logging.getLogger(__name__)
 
 
 def _load_datafusion():
+    if sys.version_info[:2] < (3, 10):
+        raise ImportError(
+            "merge_into condition expressions require Python 3.10 or newer"
+        )
     try:
         import datafusion
         return datafusion
     except ImportError:
         raise ImportError(
-            "merge_into condition expressions require the PyPaimon SQL "
-            "extra, which provides DataFusion support. Install it with: "
-            "pip install pypaimon[sql]"
+            "merge_into condition expressions require DataFusion. "
+            "Install it with: pip install 'pypaimon[datafusion]'"
         )
 
 
@@ -82,12 +86,27 @@ def filter_batch(
         return batch
     datafusion = _load_datafusion()
     rewritten = condition if _pre_rewritten else rewrite_condition(condition)
-    ctx = datafusion.SessionContext()
-    ctx.register_record_batches("_batch", [batch.to_batches()])
+    config = datafusion.SessionConfig().set(
+        "datafusion.optimizer.enable_round_robin_repartition", "false"
+    )
+    ctx = datafusion.SessionContext(config)
+    input_batches = batch.to_batches()
+    # Use one batch per partition and rebuild from partitioned batches so
+    # DataFusion neither concatenates 32-bit offsets nor reorders the input.
+    ctx.register_record_batches(
+        "_batch", [[record_batch] for record_batch in input_batches]
+    )
     result = ctx.sql(
         f'SELECT * FROM _batch WHERE {rewritten}'
     )
-    return result.to_arrow_table()
+    output_batches = [
+        record_batch
+        for partition in result.collect_partitioned()
+        for record_batch in partition
+    ]
+    if not output_batches:
+        return batch.schema.empty_table()
+    return pa.Table.from_batches(output_batches)
 
 
 def apply_condition(
@@ -162,15 +181,22 @@ def _to_paimon_predicate(expression, builder, fields_by_name):
     if kind == 'BinaryExpr':
         op = node.op().upper()
         if op in ('AND', 'OR'):
-            left = _to_paimon_predicate(
-                node.left(), builder, fields_by_name,
-            )
-            right = _to_paimon_predicate(
-                node.right(), builder, fields_by_name,
-            )
-            if left is None or right is None:
-                return None
-            predicates = [left, right]
+            predicates = []
+            pending = [expression]
+            while pending:
+                current = pending.pop()
+                if current.variant_name() == 'BinaryExpr':
+                    current_node = current.to_variant()
+                    if current_node.op().upper() == op:
+                        pending.append(current_node.right())
+                        pending.append(current_node.left())
+                        continue
+                predicate = _to_paimon_predicate(
+                    current, builder, fields_by_name,
+                )
+                if predicate is None:
+                    return None
+                predicates.append(predicate)
             if op == 'AND':
                 return PredicateBuilder.and_predicates(predicates)
             return PredicateBuilder.or_predicates(predicates)

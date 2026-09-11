@@ -48,6 +48,7 @@ class FileStoreWrite:
         self.max_seq_numbers: dict = {}
         self.write_cols = None
         self.blob_consumer = None
+        self.blob_uri_reader_factory = None
         self.commit_identifier = 0
         self.options = CoreOptions.copy(table.options)
         self.changelog_producer = self.options.changelog_producer()
@@ -110,6 +111,11 @@ class FileStoreWrite:
         )
         writer.write(data.to_batches()[0])
 
+    def roll_before_group_if_needed(self, row_count: int):
+        for writer in self.data_writers.values():
+            if isinstance(writer, DedicatedFormatWriter):
+                writer.roll_before_group_if_needed(row_count)
+
     def _check_runtime_bucket(self, partition, bucket, total_buckets):
         if total_buckets is None:
             return
@@ -145,20 +151,14 @@ class FileStoreWrite:
             raise ValueError(
                 f"target-file-row-num should be at most {max_value}")
         if row_limit != max_value:
-            # Row-count rolling is implemented in the base append writer only.
-            # DE (data-evolution) append tables are the target; primary-key,
-            # blob and vector writers override rolling and are not supported yet.
             row_rolling_supported = (
                 self.table.options.data_evolution_enabled()
-                and not self.table.is_primary_key_table
-                and not self._has_blob_columns()
-                and not (self._has_vector_columns()
-                         and options.with_vector_format()))
+                and not self.table.is_primary_key_table)
             if not row_rolling_supported:
                 raise NotImplementedError(
                     "target-file-row-num is set on this table but pypaimon supports row-count "
-                    "based file rolling only for data-evolution append tables (no primary key, "
-                    "blob or vector columns); unset it or write with Java/Flink/Spark.")
+                    "based file rolling only for data-evolution append tables (no primary key); "
+                    "unset it or write with Java/Flink/Spark.")
 
         def max_seq_number():
             return self._seq_number_stats(partition).get(bucket, 1)
@@ -174,6 +174,7 @@ class FileStoreWrite:
                 write_cols=self.write_cols,
                 blob_consumer=self.blob_consumer,
                 changelog_producer=self.changelog_producer,
+                blob_uri_reader_factory=self.blob_uri_reader_factory,
             )
         elif self._has_vector_columns() and options.with_vector_format():
             return DataVectorWriter(

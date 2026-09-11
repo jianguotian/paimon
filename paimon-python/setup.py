@@ -30,7 +30,7 @@ PYTHON_ROOT = os.path.dirname(os.path.abspath(__file__))
 FULL_VERSION_FILE = os.path.join(PYTHON_ROOT, "pypaimon", "_full_version")
 UNKNOWN_COMMIT_ID = "UNKNOWN"
 
-VERSION = "2.1.dev"
+VERSION = "2.2.dev"
 
 
 def _repository_root():
@@ -94,7 +94,7 @@ class PaimonSdist(sdist):
 
 def get_dev_version():
     """Generate dev version with commit date.
-    Format: 2.1.devYYYYMMDD (e.g. 2.1.dev20260415)
+    Format: 2.2.devYYYYMMDD (e.g. 2.2.dev20260911)
     Uses the commit date (author date) for reproducibility.
     """
     base = VERSION.rstrip(".")
@@ -216,6 +216,16 @@ def read_requirements():
 
 install_requires = read_requirements()
 
+LEROBOT_DEPENDENCIES = [
+    # datasets 4.1+ may select PyArrow 21+, while PyPaimon currently
+    # supports PyArrow <20. Pandas 2.2.2+ supports NumPy 2.x selected
+    # by LeRobot's media dependencies.
+    'datasets>=4,<4.1; python_version>="3.10"',
+    'pandas>=2.2.2,<3; python_version>="3.10"',
+    'torch>=2.3; python_version>="3.10"',
+    'lerobot>=0.4.4,<0.5; python_version>="3.10"',
+]
+
 long_description = "See Apache Paimon Python API \
 [Doc](https://paimon.apache.org/docs/master/pypaimon/python-api/) for usage."
 
@@ -224,7 +234,12 @@ setup(
     version=VERSION,
     packages=PACKAGES,
     include_package_data=True,
-    package_data={"pypaimon": ["_full_version"]},
+    package_data={
+        "pypaimon": [
+            "_full_version",
+            "benchmark/act/default_experiment.json",
+        ],
+    },
     cmdclass={"build_py": PaimonBuildPy, "sdist": PaimonSdist},
     install_requires=install_requires,
     entry_points={
@@ -233,11 +248,23 @@ setup(
         ],
     },
     extras_require={
+        'hdf5': [
+            # HDF5 loading is explicitly guarded and documented as Python 3.8+.
+            'h5py>=3,<4; python_version>="3.8"',
+        ],
+        'rosbag': [
+            # rosbags is pure Python and does not require a ROS installation.
+            'rosbags>=0.11.5,<0.12; python_version>="3.10"',
+        ],
+        'lerobot': LEROBOT_DEPENDENCIES,
         'ray': [
             'ray>=2.10,<3; python_version>="3.8"',
         ],
         'torch': [
             'torch',
+        ],
+        'act': LEROBOT_DEPENDENCIES + [
+            'Pillow; python_version>="3.10"',
         ],
         'daft': [
             'daft>=0.7.6; python_version>="3.10"',
@@ -263,7 +290,7 @@ setup(
             'lumina-data>=0.1.0'
         ],
         'vindex': [
-            'paimon-vindex==0.3.0; python_version>="3.9"',
+            'paimon-vindex==0.4.0; python_version>="3.9"',
         ],
         'full-text': [
             'paimon-ftindex==0.1.0; python_version>="3.8"',
@@ -275,6 +302,9 @@ setup(
         'hll-sketch': [
             'datasketches>=4,<5; python_version<"3.9"',
             'datasketches>=5,<6; python_version>="3.9"',
+        ],
+        'datafusion': [
+            'datafusion>=54,<55; python_version>="3.10"',
         ],
         'sql': [
             'pypaimon-rust>=0.3.0; python_version>="3.10"',
