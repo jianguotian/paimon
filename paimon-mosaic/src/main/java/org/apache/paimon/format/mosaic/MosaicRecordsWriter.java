@@ -39,7 +39,10 @@ import org.apache.paimon.types.RowType;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BaseValueVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.BaseRepeatedValueVector;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.OversizedAllocationException;
 
@@ -65,7 +68,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
     private final RowType rowType;
     private final Schema arrowSchema;
     private final long writeBatchMemory;
-    private final int initialVectorBatchRows;
+    private int vectorBatchRows;
     @Nullable private RowType verifiedDirectRowType;
     @Nullable private Schema verifiedDirectSchema;
     private long directArrowRows;
@@ -105,8 +108,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         int writeBatchSize = formatContext.writeBatchSize();
         long writeBatchMemory = formatContext.writeBatchMemory().getBytes();
         this.writeBatchMemory = writeBatchMemory;
-        this.initialVectorBatchRows =
-                initialVectorBatchRows(rowType, writeBatchSize, writeBatchMemory);
+        this.vectorBatchRows = initialVectorBatchRows(rowType, writeBatchSize, writeBatchMemory);
 
         WriterOptions options = new WriterOptions().zstdLevel(formatContext.zstdLevel());
         if (numBuckets != null) {
@@ -131,6 +133,13 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             createdArrowWriter =
                     ArrowFormatWriter.forBorrowedAllocator(
                             rowType, writeBatchSize, true, allocator, writeBatchMemory);
+            // Only batches smaller than Arrow's default allocation are sized by the batch.
+            if (writeBatchSize < BaseValueVector.INITIAL_VALUE_ALLOCATION) {
+                for (FieldVector vector :
+                        createdArrowWriter.getVectorSchemaRoot().getFieldVectors()) {
+                    setInitialCapacity(vector, writeBatchSize);
+                }
+            }
             createdArrowSchema = createdArrowWriter.getVectorSchemaRoot().getSchema();
             createdNativeWriter =
                     nativeWriterFactory.create(
@@ -143,6 +152,15 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         this.arrowFormatWriter = createdArrowWriter;
         this.nativeWriter = createdNativeWriter;
         this.arrowSchema = createdArrowSchema;
+    }
+
+    private static void setInitialCapacity(FieldVector vector, int capacity) {
+        if (vector instanceof BaseRepeatedValueVector) {
+            // Avoid Arrow's 5x estimate for fixed- or variable-width element vectors.
+            ((BaseRepeatedValueVector) vector).setInitialCapacity(capacity, 1.0);
+        } else {
+            vector.setInitialCapacity(capacity);
+        }
     }
 
     @Override
@@ -226,11 +244,9 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
 
     private int prepareVectorizedBatch(
             ColumnVector[] columns, @Nullable int[] selected, int startIndex, int maxBatchRows) {
-        // Variable-width data starts with the same 32-row memory-check granularity as row writes.
-        // A successful probe may grow before native consumption; an oversized candidate is cleared
-        // and retried so its buffers are not retained for the rest of the compaction.
-        int batchRows = Math.min(initialVectorBatchRows, maxBatchRows);
-        boolean mayExpand = true;
+        // Consume successful slices once and carry their measured size into the next slice.
+        // Double at most: a short prefix must not trigger allocation for an entire skewed batch.
+        int batchRows = Math.min(vectorBatchRows, maxBatchRows);
         while (true) {
             long memoryUsed;
             try {
@@ -242,28 +258,23 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
                     throw e;
                 }
                 batchRows = Math.max(1, batchRows / 2);
-                mayExpand = false;
                 continue;
             }
 
             if (memoryUsed > writeBatchMemory && batchRows > 1) {
                 clearArrowWriterForRetry();
                 batchRows = reducedBatchRows(batchRows, memoryUsed, writeBatchMemory);
-                mayExpand = false;
                 continue;
             }
 
-            if (mayExpand) {
-                int expandedBatchRows =
-                        Math.min(
-                                maxBatchRows,
-                                rowsWithinMemory(batchRows, memoryUsed, writeBatchMemory));
-                if (expandedBatchRows > batchRows) {
-                    arrowFormatWriter.reset();
-                    batchRows = expandedBatchRows;
-                    continue;
-                }
-            }
+            vectorBatchRows =
+                    Math.min(
+                            arrowFormatWriter.getBatchSize(),
+                            Math.min(
+                                    batchRows > Integer.MAX_VALUE / 2
+                                            ? Integer.MAX_VALUE
+                                            : batchRows * 2,
+                                    rowsWithinMemory(batchRows, memoryUsed, writeBatchMemory)));
             return batchRows;
         }
     }

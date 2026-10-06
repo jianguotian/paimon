@@ -893,6 +893,77 @@ public class ArrowBundleWriterTest {
         assertThat(nativeWriter.snapshots.get(1).rowCount).isEqualTo(2);
     }
 
+    @Test
+    public void testNullParentSkipsHiddenNotNullArrayAndMapValues() throws IOException {
+        RowType nested =
+                RowType.builder()
+                        .field("arr", DataTypes.ARRAY(DataTypes.INT().notNull()))
+                        .field(
+                                "map",
+                                DataTypes.MAP(DataTypes.INT().notNull(), DataTypes.INT().notNull()))
+                        .build();
+        RowType type = RowType.builder().field("parent", nested).build();
+        HeapIntVector values = new HeapIntVector(2);
+        values.setNullAt(0);
+        values.setInt(1, 42);
+        HeapArrayVector arrays = new HeapArrayVector(2, values);
+        arrays.putOffsetLength(0, 0, 1);
+        arrays.putOffsetLength(1, 1, 1);
+        HeapMapVector maps = new HeapMapVector(2, values, values);
+        maps.putOffsetLength(0, 0, 1);
+        maps.putOffsetLength(1, 1, 1);
+        HeapRowVector parents = new HeapRowVector(2, arrays, maps);
+        parents.setNullAt(0);
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {parents});
+        batch.setNumRows(2);
+        for (int[] selection : new int[][] {null, {1, 0, 1}}) {
+            ArrowFormatCWriter cWriter = new ArrowFormatCWriter(type, 16, true);
+            CapturingNativeWriter nativeWriter =
+                    new CapturingNativeWriter(cWriter.getVectorSchemaRoot(), cWriter);
+            try (ArrowBundleWriter writer =
+                    new ArrowBundleWriter(new NoOpPositionOutputStream(), cWriter, nativeWriter)) {
+                writer.writeBundle(new VectorizedBundleRecords(batch, selection));
+            }
+            Map<String, Object> expected = new HashMap<>();
+            expected.put("arr", Collections.singletonList(42));
+            Map<String, Object> entry = new HashMap<>();
+            entry.put("key", 42);
+            entry.put("value", 42);
+            expected.put("map", Collections.singletonList(entry));
+            List<Object> output = nativeWriter.snapshots.get(0).objectColumns.get(0);
+            assertThat(output)
+                    .containsExactlyElementsOf(
+                            selection == null
+                                    ? Arrays.asList(null, expected)
+                                    : Arrays.asList(expected, null, expected));
+        }
+    }
+
+    @Test
+    public void testVisibleNotNullArrayValueUnderNullableRowIsRejected() throws IOException {
+        RowType type =
+                RowType.builder()
+                        .field(
+                                "parent",
+                                RowType.builder()
+                                        .field("arr", DataTypes.ARRAY(DataTypes.INT().notNull()))
+                                        .build())
+                        .build();
+        HeapIntVector values = new HeapIntVector(2);
+        values.setNullAt(0);
+        values.setNullAt(1);
+        HeapArrayVector arrays = new HeapArrayVector(2, values);
+        arrays.putOffsetLength(0, 0, 1);
+        arrays.putOffsetLength(1, 1, 1);
+        HeapRowVector parents = new HeapRowVector(2, arrays);
+        parents.setNullAt(0);
+        try (ArrowFormatWriter writer = new ArrowFormatWriter(type, 16, true)) {
+            assertThatThrownBy(() -> writer.write(new ColumnVector[] {parents}, null, 0, 2))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("expected not null");
+        }
+    }
+
     private static class CapturingNativeWriter extends NativeWriter {
         private final VectorSchemaRoot vsr;
         private final ArrowFormatCWriter cWriter;

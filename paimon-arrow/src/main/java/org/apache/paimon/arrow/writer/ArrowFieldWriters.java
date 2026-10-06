@@ -906,10 +906,12 @@ public class ArrowFieldWriters {
                 int batchRows) {
             boolean[] isNull = new boolean[batchRows];
             boolean allNull = true;
+            boolean anyNull = false;
             for (int i = 0; i < batchRows; i++) {
                 int row = getRowNumber(startIndex, i, pickedInColumn);
                 if (columnVector.isNullAt(row)) {
                     isNull[i] = true;
+                    anyNull = true;
                 } else {
                     allNull = false;
                 }
@@ -917,6 +919,24 @@ public class ArrowFieldWriters {
 
             RowColumnVector rowColumnVector = (RowColumnVector) columnVector;
             VectorizedColumnBatch batch = rowColumnVector.getBatch();
+            // Values beneath a null ROW are not part of the logical input. In a mixed batch,
+            // write only visible rows so nested NOT NULL checks never inspect hidden children.
+            if (!allNull && anyNull) {
+                StructVector structVector = (StructVector) fieldVector;
+                for (int i = 0; i < batchRows; i++) {
+                    if (isNull[i]) {
+                        structVector.setNull(i);
+                    } else {
+                        int row = getRowNumber(startIndex, i, pickedInColumn);
+                        InternalRow value = rowColumnVector.getRow(row);
+                        for (int field = 0; field < fieldWriters.length; field++) {
+                            fieldWriters[field].write(i, value, field);
+                        }
+                        structVector.setIndexDefined(i);
+                    }
+                }
+                return;
+            }
             int nestedBatchRows = allNull ? 0 : batchRows;
             for (int i = 0; i < fieldWriters.length; i++) {
                 fieldWriters[i].write(

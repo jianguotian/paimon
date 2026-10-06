@@ -20,7 +20,6 @@ package org.apache.paimon.operation;
 
 import org.apache.paimon.AppendOnlyFileStore;
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.append.AppendOnlyWriter;
 import org.apache.paimon.append.cluster.Sorter;
 import org.apache.paimon.compact.CompactManager;
@@ -35,13 +34,10 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.io.BundleRecords;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataFilePathFactory;
-import org.apache.paimon.io.RollingFileWriter;
 import org.apache.paimon.io.RowDataRollingFileWriter;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.metrics.MetricRegistry;
 import org.apache.paimon.operation.metrics.BlobFetchMetrics;
-import org.apache.paimon.reader.BundleRecordIterator;
-import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.reader.RecordReaderIterator;
 import org.apache.paimon.statistics.SimpleColStatsCollector;
 import org.apache.paimon.types.DataField;
@@ -50,6 +46,7 @@ import org.apache.paimon.utils.CommitIncrement;
 import org.apache.paimon.utils.ExceptionUtils;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.IOExceptionSupplier;
+import org.apache.paimon.utils.IOUtils;
 import org.apache.paimon.utils.LongCounter;
 import org.apache.paimon.utils.MutableObjectIterator;
 import org.apache.paimon.utils.RecordWriter;
@@ -260,9 +257,10 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
 
     @Override
     public void close() throws Exception {
-        super.close();
-        if (blobFetchMetrics != null) {
-            blobFetchMetrics.close();
+        if (blobFetchMetrics == null) {
+            super.close();
+        } else {
+            IOUtils.closeAll(super::close, blobFetchMetrics::close);
         }
     }
 
@@ -296,9 +294,7 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
             }
         }
         try {
-            writeCompactReader(
-                    readForCompact.createReader(partition, bucket, toCompact, dvFactories),
-                    rewriter);
+            rewriter.write(createFilesIterator(partition, bucket, toCompact, dvFactories));
         } catch (Exception e) {
             collectedExceptions = e;
         } finally {
@@ -312,33 +308,6 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
             throw collectedExceptions;
         }
         return rewriter.result();
-    }
-
-    private static void writeCompactReader(
-            RecordReader<InternalRow> reader, RollingFileWriter<InternalRow, ?> rewriter)
-            throws Exception {
-        try {
-            RecordReader.RecordIterator<InternalRow> batch;
-            while ((batch = reader.readBatch()) != null) {
-                try {
-                    if (batch instanceof BundleRecordIterator) {
-                        BundleRecords bundle = ((BundleRecordIterator) batch).bundleRecords();
-                        if (bundle.rowCount() > 0) {
-                            rewriter.writeBundle(bundle);
-                        }
-                    } else {
-                        InternalRow row;
-                        while ((row = batch.next()) != null) {
-                            rewriter.write(row);
-                        }
-                    }
-                } finally {
-                    batch.releaseBatch();
-                }
-            }
-        } finally {
-            reader.close();
-        }
     }
 
     public List<DataFileMeta> clusterRewrite(
@@ -379,8 +348,7 @@ public abstract class BaseAppendFileStoreWrite extends MemoryFileStoreWrite<Inte
         return rewriter.result();
     }
 
-    @VisibleForTesting
-    RowDataRollingFileWriter createRollingFileWriter(
+    private RowDataRollingFileWriter createRollingFileWriter(
             BinaryRow partition, int bucket, Supplier<LongCounter> seqNumCounterSupplier) {
         return new RowDataRollingFileWriter(
                 fileIO,

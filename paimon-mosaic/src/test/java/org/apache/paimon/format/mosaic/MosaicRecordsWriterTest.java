@@ -21,6 +21,9 @@ package org.apache.paimon.format.mosaic;
 import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.reader.ArrowBatchReader;
+import org.apache.paimon.arrow.vector.ArrowFormatWriter;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
@@ -385,6 +388,64 @@ class MosaicRecordsWriterTest {
         assertThat(batchRowCounts.stream().mapToInt(Integer::intValue).sum()).isEqualTo(128);
         assertThat(batchBufferSizes).allMatch(size -> size <= memoryLimit.getBytes());
         assertThat(writer.genericBundleRows()).isZero();
+    }
+
+    @Test
+    void testSkewedVectorizedBundleBoundsAllocationAndSourceReads() throws Exception {
+        int rows = 1024;
+        long[] readBytes = {0};
+        HeapBytesVector values =
+                new HeapBytesVector(rows) {
+                    @Override
+                    public Bytes getBytes(int row) {
+                        readBytes[0] += length[row];
+                        return super.getBytes(row);
+                    }
+                };
+        byte[] large = new byte[65536];
+        long payloadBytes = 0;
+        for (int i = 0; i < rows; i++) {
+            int length = i < 32 ? 1 : large.length;
+            values.putByteArray(i, large, 0, length);
+            payloadBytes += length;
+        }
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {values});
+        batch.setNumRows(rows);
+        List<Integer> lengths = new ArrayList<>();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        doAnswer(
+                        invocation -> {
+                            VectorSchemaRoot root = invocation.getArgument(0);
+                            VarCharVector column = (VarCharVector) root.getVector(0);
+                            for (int i = 0; i < root.getRowCount(); i++) {
+                                lengths.add(column.get(i).length);
+                            }
+                            return null;
+                        })
+                .when(nativeWriter)
+                .write(any(VectorSchemaRoot.class));
+        try (RootAllocator allocator = new RootAllocator()) {
+            MosaicRecordsWriter writer =
+                    createWriter(
+                            RowType.builder().field("a", DataTypes.STRING()).build(),
+                            allocator,
+                            nativeWriter,
+                            rows,
+                            MemorySize.ofMebiBytes(1));
+            try {
+                writer.writeBundle(new VectorizedBundleRecords(batch, null));
+            } finally {
+                writer.close();
+            }
+            assertThat(allocator.getPeakMemoryAllocation()).isLessThan(16L * 1024 * 1024);
+        }
+        assertThat(readBytes[0]).isLessThan(payloadBytes * 5 / 4);
+        assertThat(lengths)
+                .containsExactlyElementsOf(
+                        IntStream.range(0, rows)
+                                .map(i -> i < 32 ? 1 : large.length)
+                                .boxed()
+                                .collect(Collectors.toList()));
     }
 
     @Test
@@ -942,5 +1003,182 @@ class MosaicRecordsWriterTest {
         private void putTestingChild(FieldVector childVector) {
             putChild(childVector.getName(), childVector);
         }
+    }
+
+    @Test
+    void testVectorsAreSizedByWriteBatchSize() throws Exception {
+        // 2,000 columns: Arrow's default per-vector allocation would exceed 60 MB here.
+        RowType.Builder builder = RowType.builder();
+        for (int i = 0; i < 2000; i++) {
+            builder.field("c" + i, DataTypes.DOUBLE());
+        }
+        RowType wideType = builder.build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        try (RootAllocator allocator = new RootAllocator()) {
+            MosaicRecordsWriter writer =
+                    new MosaicRecordsWriter(
+                            new ByteArrayOutputStream(),
+                            wideType,
+                            new FileFormatFactory.FormatContext(new Options(), 1024, 4),
+                            Collections.emptyList(),
+                            null,
+                            allocator,
+                            (outputStream, arrowSchema, options, bufferAllocator) -> nativeWriter);
+            GenericRow row = new GenericRow(wideType.getFieldCount());
+            row.setField(0, 1.0d);
+            writer.addElement(row);
+            assertThat(allocator.getAllocatedMemory()).isLessThan(8L * 1024 * 1024);
+            writer.close();
+        }
+    }
+
+    @Test
+    void testLargeBatchSizeWithSmallMemoryBudgetKeepsArrowDefaultAllocation() throws Exception {
+        // write.batch-size=65536 with write.batch-memory=128 KiB: the memory budget flushes long
+        // before the row limit, so the first row must not allocate for the whole batch size.
+        RowType rowType = mixedRowType(100);
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        try (RootAllocator allocator = new RootAllocator(16L * 1024 * 1024)) {
+            MosaicRecordsWriter writer =
+                    createWriter(
+                            rowType, allocator, nativeWriter, 65536, MemorySize.ofKibiBytes(128));
+            writer.addElement(firstRow(rowType));
+            assertThat(allocator.getAllocatedMemory())
+                    .isEqualTo(baselineFirstRowAllocation(rowType, 65536));
+            writer.close();
+        }
+    }
+
+    @Test
+    void testInitialCapacityNeverExceedsArrowDefaultAllocation() throws Exception {
+        // DOUBLE, STRING and ARRAY<DOUBLE> columns cover the fixed-width, variable-width and
+        // repeated vector families, whose default sizing differs.
+        for (RowType rowType : familyRowTypes()) {
+            for (int batchSize : new int[] {4, 1024, 3969, 3970, 65536}) {
+                long baseline = baselineFirstRowAllocation(rowType, batchSize);
+                MosaicWriter nativeWriter = mock(MosaicWriter.class);
+                try (RootAllocator allocator = new RootAllocator()) {
+                    MosaicRecordsWriter writer =
+                            createWriter(
+                                    rowType,
+                                    allocator,
+                                    nativeWriter,
+                                    batchSize,
+                                    MemorySize.VALUE_128_MB);
+                    try {
+                        writer.addElement(firstRow(rowType));
+                        assertThat(allocator.getAllocatedMemory())
+                                .as("batch size %d", batchSize)
+                                .isLessThanOrEqualTo(baseline);
+                        // Arrow rounds buffers to powers of two, so only clearly smaller batches
+                        // allocate less.
+                        if (batchSize <= 1024) {
+                            assertThat(allocator.getAllocatedMemory())
+                                    .as("batch size %d", batchSize)
+                                    .isLessThan(baseline);
+                        }
+                    } finally {
+                        writer.close();
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void testFillingOneBatchDoesNotReallocate() throws Exception {
+        // Fixed-width vectors sized for the batch must hold a full batch without growing.
+        RowType.Builder builder = RowType.builder();
+        for (int i = 0; i < 100; i++) {
+            builder.field("d" + i, DataTypes.DOUBLE());
+        }
+        RowType rowType = builder.build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        try (RootAllocator allocator = new RootAllocator()) {
+            MosaicRecordsWriter writer =
+                    createWriter(rowType, allocator, nativeWriter, 1024, MemorySize.VALUE_128_MB);
+            writer.addElement(firstRow(rowType));
+            long afterFirstRow = allocator.getAllocatedMemory();
+            for (int i = 1; i < 1024; i++) {
+                writer.addElement(firstRow(rowType));
+            }
+            assertThat(allocator.getAllocatedMemory()).isEqualTo(afterFirstRow);
+            verify(nativeWriter, never()).write(any());
+            writer.close();
+        }
+    }
+
+    /** The mixed schema plus one schema per vector family, so a skipped family shows. */
+    private static List<RowType> familyRowTypes() {
+        RowType.Builder doubles = RowType.builder();
+        RowType.Builder strings = RowType.builder();
+        RowType.Builder arrays = RowType.builder();
+        for (int i = 0; i < 60; i++) {
+            doubles.field("d" + i, DataTypes.DOUBLE());
+            strings.field("s" + i, DataTypes.STRING());
+            arrays.field("a" + i, DataTypes.ARRAY(DataTypes.DOUBLE()));
+        }
+        return Arrays.asList(mixedRowType(60), doubles.build(), strings.build(), arrays.build());
+    }
+
+    private static RowType mixedRowType(int columnsPerType) {
+        RowType.Builder builder = RowType.builder();
+        for (int i = 0; i < columnsPerType; i++) {
+            builder.field("d" + i, DataTypes.DOUBLE());
+            builder.field("s" + i, DataTypes.STRING());
+            builder.field("a" + i, DataTypes.ARRAY(DataTypes.DOUBLE()));
+        }
+        return builder.build();
+    }
+
+    private static GenericRow firstRow(RowType rowType) {
+        GenericRow row = new GenericRow(rowType.getFieldCount());
+        for (int i = 0; i < rowType.getFieldCount(); i++) {
+            switch (rowType.getTypeAt(i).getTypeRoot()) {
+                case DOUBLE:
+                    row.setField(i, 1.0d);
+                    break;
+                case VARCHAR:
+                    row.setField(i, BinaryString.fromString("one"));
+                    break;
+                default:
+                    row.setField(i, new GenericArray(new Object[] {1.0d}));
+            }
+        }
+        return row;
+    }
+
+    /** First-row allocation of the same writer without the capacity loop. */
+    private static long baselineFirstRowAllocation(RowType rowType, int batchSize) {
+        try (RootAllocator allocator = new RootAllocator()) {
+            ArrowFormatWriter writer =
+                    ArrowFormatWriter.forBorrowedAllocator(
+                            rowType,
+                            batchSize,
+                            true,
+                            allocator,
+                            MemorySize.VALUE_128_MB.getBytes());
+            assertThat(writer.write(firstRow(rowType))).isTrue();
+            long allocated = allocator.getAllocatedMemory();
+            writer.close();
+            return allocated;
+        }
+    }
+
+    private static MosaicRecordsWriter createWriter(
+            RowType rowType,
+            RootAllocator allocator,
+            MosaicWriter nativeWriter,
+            int writeBatchSize,
+            MemorySize writeBatchMemory) {
+        return new MosaicRecordsWriter(
+                new ByteArrayOutputStream(),
+                rowType,
+                new FileFormatFactory.FormatContext(
+                        new Options(), 1024, writeBatchSize, writeBatchMemory),
+                Collections.emptyList(),
+                null,
+                allocator,
+                (outputStream, arrowSchema, options, bufferAllocator) -> nativeWriter);
     }
 }
