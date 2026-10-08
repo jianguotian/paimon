@@ -18,6 +18,7 @@
 
 package org.apache.paimon.format.mosaic;
 
+import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.reader.ArrowVectorizedRecordIterator;
 import org.apache.paimon.data.InternalRow;
@@ -334,8 +335,8 @@ class MosaicRecordsReaderTest {
         ArrowVectorizedRecordIterator arrowRecords = (ArrowVectorizedRecordIterator) records;
         assertThat(arrowRecords.arrowBundle().getVectorSchemaRoot()).isSameAs(root);
         BundleRecords bundle = arrowRecords.arrowBundle();
-        assertThat(bundle).isInstanceOf(MosaicArrowBundleRecords.class);
-        assertThat(((MosaicArrowBundleRecords) bundle).getVectorSchemaRoot()).isSameAs(root);
+        assertThat(bundle).isInstanceOf(ArrowBundleRecords.class);
+        assertThat(((ArrowBundleRecords) bundle).getVectorSchemaRoot()).isSameAs(root);
         assertThat(arrowRecords.batch().getNumRows()).isEqualTo(3);
         assertThat(records.next().getInt(0)).isEqualTo(10);
         assertThat(records.returnedPosition()).isZero();
@@ -542,7 +543,7 @@ class MosaicRecordsReaderTest {
                         new Path("file:/tmp/mosaic-reader-test"));
         FileRecordIterator<InternalRow> tracked = dataFileReader.readBatch();
 
-        assertThat(tracked).isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+        assertThat(tracked).isNotInstanceOf(VectorizedRecordIterator.class);
         InternalRow row = tracked.next();
         assertThat(row.getInt(0)).isEqualTo(7);
         assertThat(row.getLong(1)).isEqualTo(1000L);

@@ -27,6 +27,7 @@ import org.apache.paimon.data.columnar.heap.HeapLongVector;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.reader.FileRecordIterator;
 import org.apache.paimon.reader.FileRecordReader;
+import org.apache.paimon.reader.VectorizedRecordIterator;
 import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
@@ -71,7 +72,7 @@ public class DataFileRecordReaderTest {
             FileRecordIterator<InternalRow> iterator = reader.readBatch();
 
             assertThat(iterator).isNotSameAs(delegate.iterator);
-            assertThat(iterator).isInstanceOf(VectorizedRowIterator.class);
+            assertThat(iterator).isNotInstanceOf(VectorizedRecordIterator.class);
             assertReaderOwnedColumns(delegate);
 
             InternalRow row = iterator.next();
@@ -110,7 +111,7 @@ public class DataFileRecordReaderTest {
         FileRecordIterator<InternalRow> iterator = reader.readBatch();
 
         assertThat(iterator).isNotSameAs(delegate.iterator);
-        assertThat(iterator).isInstanceOf(VectorizedRowIterator.class);
+        assertThat(iterator).isNotInstanceOf(VectorizedRecordIterator.class);
         assertReaderOwnedColumns(delegate);
         InternalRow row = iterator.next();
         assertThat(row.getFieldCount()).isEqualTo(2);

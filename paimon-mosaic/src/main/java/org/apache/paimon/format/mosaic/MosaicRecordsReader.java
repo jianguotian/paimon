@@ -35,6 +35,7 @@ import org.apache.paimon.mosaic.MosaicReader;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.FileRecordIterator;
 import org.apache.paimon.reader.FileRecordReader;
+import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
@@ -243,7 +244,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             createdAllProjectedColumnsMissing = existingColumns.isEmpty();
             this.arrowBundleCompatible =
                     existingColumns.size() == projectedFieldCount
-                            && MosaicArrowSchemaCompatibility.matchesProjection(
+                            && MosaicArrowProjection.matchesProjection(
                                     projectedRowType, fileSchema);
             if (!existingColumns.isEmpty()
                     && !hasExactProjection(projectedNames, fileSchema.getFields())) {
@@ -793,13 +794,20 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
 
         @Override
         public ArrowBundleRecords arrowBundle() {
-            return new MosaicArrowBundleRecords(vsr, arrowRowType);
+            return new ArrowBundleRecords(vsr, arrowRowType, true);
         }
 
         @Override
         public ColumnarRowIterator assignRowTracking(
                 Long firstRowId, Long snapshotId, Map<String, Integer> meta) {
-            return vectorizedFallback().assignRowTracking(firstRowId, snapshotId, meta);
+            ColumnarRowIterator fallback = vectorizedFallback();
+            if (firstRowId != null && meta.containsKey(SpecialFields.ROW_ID.name())) {
+                fallback =
+                        new ColumnarRowIterator(
+                                filePath, new ColumnarRow(fallback.batch()), batchRecycler);
+                fallback.reset(startPosition);
+            }
+            return fallback.assignRowTracking(firstRowId, snapshotId, meta);
         }
 
         private VectorizedRowIterator vectorizedFallback() {

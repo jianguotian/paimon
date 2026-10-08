@@ -194,7 +194,7 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testCrossRootDataFileDirectArrowRewriteCombinesRowGroups() throws IOException {
+    void testCrossRootDataFileBundleRewriteCombinesRowGroups() throws IOException {
         RowType rowType =
                 RowType.builder()
                         .field("id", DataTypes.INT())
@@ -254,8 +254,8 @@ class MosaicReaderWriterTest {
         FormatReaderContext sourceContext =
                 new FormatReaderContext(
                         fileIO, sourcePath, fileIO.getFileSize(sourcePath), null, null);
-        // Reader and writer factories own independent allocator roots. Mosaic consumes the
-        // borrowed reader batch synchronously without moving its buffers to the writer root.
+        // Reader and writer factories own independent allocator roots. The community writer
+        // copies through rows when its strict direct-write requirements are not satisfied.
         try (DataFileRecordReader sourceReader =
                         new DataFileRecordReader(
                                 rowType,
@@ -277,7 +277,7 @@ class MosaicReaderWriterTest {
                     assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
                     ArrowBundleRecords bundle =
                             ((ArrowVectorizedRecordIterator) batch).arrowBundle();
-                    assertThat(bundle).isInstanceOf(MosaicArrowBundleRecords.class);
+                    assertThat(bundle).isInstanceOf(ArrowBundleRecords.class);
                     assertThat(bundle.hasIdentityMapping()).isTrue();
                     targetWriter.writeBundle(bundle);
                 } finally {
@@ -293,8 +293,6 @@ class MosaicReaderWriterTest {
         assertThat(targetFile.rowCount()).isEqualTo(6);
         assertThat(targetFile.minSequenceNumber()).isEqualTo(5);
         assertThat(targetFile.maxSequenceNumber()).isEqualTo(10);
-        assertThat(mosaicWriter.directArrowRows()).isEqualTo(6);
-        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isZero();
 
         List<InternalRow> result = readAll(rowType, rowType, targetPath, null);
         assertThat(result).hasSize(6);
@@ -312,7 +310,7 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testExternalRootArrowBundleUsesDirectWrite() throws IOException {
+    void testExternalRootArrowBundlePreservesRows() throws IOException {
         RowType rowType = RowType.builder().field("id", DataTypes.INT()).build();
         Path targetPath = newPath();
         LocalFileIO fileIO = new LocalFileIO();
@@ -333,9 +331,6 @@ class MosaicReaderWriterTest {
             root.setRowCount(1);
 
             targetWriter.writeBundle(new ArrowBundleRecords(root, rowType, true));
-
-            assertThat(targetWriter.directArrowRows()).isEqualTo(1);
-            assertThat(targetWriter.mosaicBundleFallbackRows()).isZero();
         }
 
         List<InternalRow> result = readAll(rowType, rowType, targetPath, null);
@@ -388,8 +383,6 @@ class MosaicReaderWriterTest {
                 batch.releaseBatch();
             }
             assertThat(sourceReader.readBatch()).isNull();
-            assertThat(targetWriter.directArrowRows()).isZero();
-            assertThat(targetWriter.mosaicBundleFallbackRows()).isEqualTo(1);
         }
 
         List<InternalRow> result = readAll(targetType, targetType, targetPath, null);
@@ -398,7 +391,7 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testNotNullToNullableRewriteUsesDirectArrowWithoutDataLoss() throws IOException {
+    void testNotNullToNullableRewritePreservesRows() throws IOException {
         RowType sourceType =
                 new RowType(
                         Collections.singletonList(
@@ -474,8 +467,6 @@ class MosaicReaderWriterTest {
         assertThat(targetFile.rowCount()).isEqualTo(2);
         assertThat(targetFile.minSequenceNumber()).isEqualTo(5);
         assertThat(targetFile.maxSequenceNumber()).isEqualTo(6);
-        assertThat(mosaicWriter.directArrowRows()).isEqualTo(2);
-        assertThat(mosaicWriter.mosaicBundleFallbackRows()).isZero();
 
         List<InternalRow> result = readAll(targetType, targetType, targetPath, null);
         assertThat(result).hasSize(2);

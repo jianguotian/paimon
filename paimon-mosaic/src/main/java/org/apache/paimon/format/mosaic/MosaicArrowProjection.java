@@ -19,7 +19,6 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowUtils;
-import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.vector.types.pojo.Field;
@@ -31,23 +30,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
-/** Compatibility checks for passing Arrow batches directly between Mosaic readers and writers. */
-final class MosaicArrowSchemaCompatibility {
+/** Validates that a borrowed Arrow batch can represent the requested reader projection. */
+final class MosaicArrowProjection {
 
-    private MosaicArrowSchemaCompatibility() {}
-
-    static boolean matchesRowType(RowType expected, RowType actual) {
-        if (expected.getFieldCount() != actual.getFieldCount()) {
-            return false;
-        }
-
-        for (int i = 0; i < expected.getFieldCount(); i++) {
-            if (!matchesDataField(expected.getFields().get(i), actual.getFields().get(i))) {
-                return false;
-            }
-        }
-        return true;
-    }
+    private MosaicArrowProjection() {}
 
     static boolean matchesProjection(RowType projectedRowType, Schema fileSchema) {
         List<Field> expectedFields =
@@ -67,41 +53,14 @@ final class MosaicArrowSchemaCompatibility {
 
         for (Field expectedField : expectedFields) {
             Field fileField = fileFieldsByName.get(expectedField.getName());
-            if (fileField == null || !matchesField(expectedField, fileField, false)) {
+            if (fileField == null || !matchesField(expectedField, fileField)) {
                 return false;
             }
         }
         return true;
     }
 
-    static boolean matchesWriter(Schema expectedSchema, Schema actualSchema) {
-        return matchesFields(expectedSchema.getFields(), actualSchema.getFields(), true);
-    }
-
-    private static boolean matchesFields(
-            List<Field> expectedFields, List<Field> actualFields, boolean checkPresentMetadata) {
-        if (expectedFields.size() != actualFields.size()) {
-            return false;
-        }
-
-        for (int i = 0; i < expectedFields.size(); i++) {
-            if (!matchesField(expectedFields.get(i), actualFields.get(i), checkPresentMetadata)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean matchesDataField(DataField expected, DataField actual) {
-        return actual != null
-                && expected.id() == actual.id()
-                && expected.name().equals(actual.name())
-                && isNullabilityCompatible(expected.type().isNullable(), actual.type().isNullable())
-                && expected.type().equalsIgnoreNullable(actual.type());
-    }
-
-    private static boolean matchesField(
-            Field expected, Field actual, boolean checkPresentMetadata) {
+    private static boolean matchesField(Field expected, Field actual) {
         if (!expected.getName().equals(actual.getName())
                 || !expected.getType().equals(actual.getType())
                 || !isNullabilityCompatible(expected.isNullable(), actual.isNullable())
@@ -111,26 +70,13 @@ final class MosaicArrowSchemaCompatibility {
             return false;
         }
 
-        // Mosaic files may not persist Arrow field metadata. If metadata is present, however,
-        // require it to agree with the Paimon schema before passing buffers directly to the native
-        // writer (notably PARQUET:field_id). A name-mapped fallback rewrites the rows into the
-        // writer's own Arrow schema, so source metadata does not affect that path.
-        Map<String, String> actualMetadata = actual.getMetadata();
-        if (checkPresentMetadata
-                && actualMetadata != null
-                && !actualMetadata.isEmpty()
-                && !Objects.equals(expected.getMetadata(), actualMetadata)) {
-            return false;
-        }
-
         List<Field> expectedChildren = expected.getChildren();
         List<Field> actualChildren = actual.getChildren();
         if (expectedChildren.size() != actualChildren.size()) {
             return false;
         }
         for (int i = 0; i < expectedChildren.size(); i++) {
-            if (!matchesField(
-                    expectedChildren.get(i), actualChildren.get(i), checkPresentMetadata)) {
+            if (!matchesField(expectedChildren.get(i), actualChildren.get(i))) {
                 return false;
             }
         }

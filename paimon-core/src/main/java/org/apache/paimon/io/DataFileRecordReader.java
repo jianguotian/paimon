@@ -206,6 +206,10 @@ public class DataFileRecordReader implements FileRecordReader<InternalRow> {
                 iterator =
                         ((ColumnarRowIterator) iterator)
                                 .assignRowTracking(firstRowId, maxSequenceNumber, systemFields);
+                if (firstRowId != null && systemFields.containsKey(SpecialFields.ROW_ID.name())) {
+                    // Synthesized row IDs depend on next()/returnedPosition(), not vector indexes.
+                    iterator = iterator.transform(row -> row);
+                }
             }
         } else {
             if (partitionInfo != null) {
