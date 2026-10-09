@@ -20,8 +20,10 @@ package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
+import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.format.FileFormatFactory;
 import org.apache.paimon.mosaic.MosaicWriter;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
@@ -39,9 +41,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.same;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /** Test for {@link MosaicRecordsWriter}. */
@@ -188,5 +192,66 @@ class MosaicRecordsWriterTest {
         int closeCount() {
             return closeCount;
         }
+    }
+
+    @Test
+    void testRejectsNonPositiveWriteBatchSize() {
+        RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
+
+        for (int writeBatchSize : new int[] {0, -1}) {
+            CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+            FileFormatFactory.FormatContext formatContext =
+                    new FileFormatFactory.FormatContext(new Options(), 1024, writeBatchSize);
+
+            assertThatThrownBy(
+                            () -> {
+                                try (MosaicRecordsWriter ignored =
+                                        createWriter(
+                                                rowType,
+                                                allocator,
+                                                mock(MosaicWriter.class),
+                                                writeBatchSize,
+                                                MemorySize.VALUE_128_MB)) {
+                                    throw new AssertionError(
+                                            "Accepted write batch size " + writeBatchSize);
+                                }
+                            })
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("write.batch-size")
+                    .hasMessageContaining("greater than 0");
+            assertThat(allocator.closeCount()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void testNativeWriteFailureIsNotRetriedDuringClose() throws Exception {
+        RowType type = RowType.builder().field("a", DataTypes.INT()).build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        RuntimeException failure = new RuntimeException("native write failed");
+        doThrow(failure).when(nativeWriter).write(any(VectorSchemaRoot.class));
+        MosaicRecordsWriter writer = createWriter(type, new RootAllocator(), nativeWriter);
+        writer.addElement(GenericRow.of(1));
+        assertThatThrownBy(writer::flush).isSameAs(failure);
+        assertThatThrownBy(() -> writer.addElement(GenericRow.of(2)))
+                .isInstanceOf(IllegalStateException.class);
+        writer.close();
+        verify(nativeWriter, times(1)).write(any(VectorSchemaRoot.class));
+    }
+
+    private static MosaicRecordsWriter createWriter(
+            RowType rowType,
+            RootAllocator allocator,
+            MosaicWriter nativeWriter,
+            int writeBatchSize,
+            MemorySize writeBatchMemory) {
+        return new MosaicRecordsWriter(
+                new ByteArrayOutputStream(),
+                rowType,
+                new FileFormatFactory.FormatContext(
+                        new Options(), 1024, writeBatchSize, writeBatchMemory),
+                Collections.emptyList(),
+                null,
+                allocator,
+                (outputStream, arrowSchema, options, bufferAllocator) -> nativeWriter);
     }
 }
