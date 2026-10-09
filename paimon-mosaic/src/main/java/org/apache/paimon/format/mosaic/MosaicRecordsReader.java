@@ -18,16 +18,24 @@
 
 package org.apache.paimon.format.mosaic;
 
+import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.reader.ArrowBatchReader;
+import org.apache.paimon.arrow.reader.ArrowVectorizedRecordIterator;
 import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.columnar.ColumnVector;
+import org.apache.paimon.data.columnar.ColumnarRow;
+import org.apache.paimon.data.columnar.ColumnarRowIterator;
+import org.apache.paimon.data.columnar.VectorizedColumnBatch;
+import org.apache.paimon.data.columnar.VectorizedRowIterator;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.mosaic.ColumnStatistics;
 import org.apache.paimon.mosaic.MosaicReader;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.FileRecordIterator;
 import org.apache.paimon.reader.FileRecordReader;
+import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
@@ -43,7 +51,6 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -60,13 +67,17 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     private final BufferAllocator allocator;
     private final int numRowGroups;
     private final RowType dataSchemaRowType;
+    private final RowType projectedRowType;
     private final int projectedFieldCount;
     private final boolean allProjectedColumnsMissing;
+    private final boolean arrowBundleCompatible;
     @Nullable private final List<Predicate> predicates;
 
     private int currentRowGroup;
-    private long returnedPosition = -1;
-    private VectorSchemaRoot currentVsr;
+    private long nextBatchPosition;
+
+    private final Object batchLock = new Object();
+    private final List<BatchRecycler> activeBatches = new ArrayList<>();
 
     public MosaicRecordsReader(
             MosaicInputFileAdapter inputFileAdapter,
@@ -98,6 +109,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         this.filePath = filePath;
         this.inputFileAdapter = inputFileAdapter;
         this.dataSchemaRowType = dataSchemaRowType;
+        this.projectedRowType = projectedRowType;
         this.projectedFieldCount = projectedRowType.getFieldCount();
         this.predicates = predicates;
         this.allocator = allocator;
@@ -122,7 +134,12 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
                 }
             }
             createdAllProjectedColumnsMissing = existingColumns.isEmpty();
-            if (!existingColumns.isEmpty()) {
+            this.arrowBundleCompatible =
+                    existingColumns.size() == projectedFieldCount
+                            && MosaicArrowProjection.matchesProjection(
+                                    projectedRowType, fileSchema);
+            if (!existingColumns.isEmpty()
+                    && !hasExactProjection(projectedNames, fileSchema.getFields())) {
                 createdReader.project(existingColumns.toArray(new String[0]));
             }
 
@@ -144,64 +161,57 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     @Override
     public FileRecordIterator<InternalRow> readBatch() throws IOException {
         while (currentRowGroup < numRowGroups) {
-            int numRows = reader.rowGroupNumRows(currentRowGroup);
-            if (!matchesRowGroup(currentRowGroup, numRows)) {
-                returnedPosition += numRows;
-                currentRowGroup++;
+            int rowGroup = currentRowGroup++;
+            int numRows = reader.rowGroupNumRows(rowGroup);
+            long startPosition = nextBatchPosition;
+            nextBatchPosition += numRows;
+            if (!matchesRowGroup(rowGroup, numRows)) {
                 continue;
             }
-
-            releaseCurrentVsr();
-
             if (allProjectedColumnsMissing) {
-                currentRowGroup++;
-                return allNullIterator(numRows);
+                return allNullIterator(startPosition, numRows);
             }
-
-            VectorSchemaRoot vsr = reader.readRowGroup(currentRowGroup, allocator);
-            currentRowGroup++;
-            this.currentVsr = vsr;
-
-            Iterator<InternalRow> rows = arrowBatchReader.readBatch(vsr).iterator();
-
-            return new FileRecordIterator<InternalRow>() {
-                @Override
-                public long returnedPosition() {
-                    return returnedPosition;
+            VectorSchemaRoot vsr = reader.readRowGroup(rowGroup, allocator);
+            BatchRecycler recycler = recycler(vsr);
+            try {
+                if (arrowBundleCompatible) {
+                    return new MosaicArrowVectorizedRecordIterator(
+                            filePath,
+                            startPosition,
+                            projectedRowType,
+                            arrowBatchReader,
+                            vsr,
+                            recycler);
                 }
-
-                @Override
-                public Path filePath() {
-                    return filePath;
+                VectorizedColumnBatch columns = arrowBatchReader.readVectorizedBatch(vsr);
+                VectorizedRowIterator iterator =
+                        new VectorizedRowIterator(filePath, new ColumnarRow(columns), recycler);
+                iterator.reset(startPosition);
+                return iterator;
+            } catch (Throwable t) {
+                try {
+                    recycler.run();
+                } catch (Throwable closeFailure) {
+                    t.addSuppressed(closeFailure);
                 }
-
-                @Nullable
-                @Override
-                public InternalRow next() {
-                    if (rows.hasNext()) {
-                        returnedPosition++;
-                        return rows.next();
-                    }
-                    return null;
-                }
-
-                @Override
-                public void releaseBatch() {
-                    releaseCurrentVsr();
-                }
-            };
+                rethrow(t);
+            }
         }
         return null;
     }
 
-    private FileRecordIterator<InternalRow> allNullIterator(int numRows) {
+    private FileRecordIterator<InternalRow> allNullIterator(long batchStartPosition, int numRows) {
         GenericRow row = new GenericRow(projectedFieldCount);
         return new FileRecordIterator<InternalRow>() {
             private int position;
+            private long batchReturnedPosition = -1;
 
             @Override
             public long returnedPosition() {
-                return returnedPosition;
+                if (batchReturnedPosition < 0) {
+                    throw new IllegalStateException("returnedPosition() is called before next()");
+                }
+                return batchReturnedPosition;
             }
 
             @Override
@@ -213,8 +223,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             @Override
             public InternalRow next() {
                 if (position < numRows) {
+                    batchReturnedPosition = batchStartPosition + position;
                     position++;
-                    returnedPosition++;
                     return row;
                 }
                 return null;
@@ -266,10 +276,49 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         return true;
     }
 
-    private void releaseCurrentVsr() {
-        if (currentVsr != null) {
-            currentVsr.close();
-            currentVsr = null;
+    private BatchRecycler recycler(VectorSchemaRoot vsr) {
+        try {
+            BatchRecycler recycler = new BatchRecycler(vsr);
+            synchronized (batchLock) {
+                activeBatches.add(recycler);
+            }
+            return recycler;
+        } catch (Throwable t) {
+            try {
+                vsr.close();
+            } catch (Throwable closeFailure) {
+                t.addSuppressed(closeFailure);
+            }
+            throw rethrowUnchecked(t);
+        }
+    }
+
+    private static boolean hasExactProjection(List<String> projectedNames, List<Field> fileFields) {
+        if (projectedNames.size() != fileFields.size()) {
+            return false;
+        }
+        for (int i = 0; i < projectedNames.size(); i++) {
+            if (!projectedNames.get(i).equals(fileFields.get(i).getName())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void releaseActiveBatches() {
+        Throwable failure = null;
+        synchronized (batchLock) {
+            while (!activeBatches.isEmpty()) {
+                BatchRecycler recycler = activeBatches.get(activeBatches.size() - 1);
+                try {
+                    recycler.releaseLocked();
+                } catch (Throwable t) {
+                    failure = addSuppressed(failure, t);
+                }
+            }
+        }
+        if (failure != null) {
+            throw rethrowUnchecked(failure);
         }
     }
 
@@ -278,7 +327,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         Throwable throwable = null;
 
         try {
-            releaseCurrentVsr();
+            releaseActiveBatches();
         } catch (Throwable t) {
             throwable = t;
         }
@@ -289,10 +338,12 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             throwable = addSuppressed(throwable, t);
         }
 
-        try {
-            allocator.close();
-        } catch (Throwable t) {
-            throwable = addSuppressed(throwable, t);
+        synchronized (batchLock) {
+            try {
+                allocator.close();
+            } catch (Throwable t) {
+                throwable = addSuppressed(throwable, t);
+            }
         }
 
         try {
@@ -367,6 +418,86 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     interface NativeReaderOpener {
 
         MosaicReader open(
-                MosaicInputFileAdapter inputFileAdapter, long fileSize, BufferAllocator allocator);
+                MosaicInputFileAdapter inputFileAdapter, long fileSize, BufferAllocator allocator)
+                throws IOException;
+    }
+
+    private class BatchRecycler implements Runnable {
+
+        private final VectorSchemaRoot vsr;
+        private boolean released;
+
+        private BatchRecycler(VectorSchemaRoot vsr) {
+            this.vsr = vsr;
+        }
+
+        @Override
+        public void run() {
+            synchronized (batchLock) {
+                releaseLocked();
+            }
+        }
+
+        private void releaseLocked() {
+            if (released) {
+                return;
+            }
+
+            released = true;
+            activeBatches.remove(this);
+            vsr.close();
+        }
+    }
+
+    private static class MosaicArrowVectorizedRecordIterator extends VectorizedRowIterator
+            implements ArrowVectorizedRecordIterator {
+
+        private final RowType arrowRowType;
+        private final VectorSchemaRoot vsr;
+        private final BatchRecycler batchRecycler;
+        private final long startPosition;
+
+        private MosaicArrowVectorizedRecordIterator(
+                Path filePath,
+                long startPosition,
+                RowType arrowRowType,
+                ArrowBatchReader arrowBatchReader,
+                VectorSchemaRoot vsr,
+                BatchRecycler recycler) {
+            super(filePath, new ColumnarRow(arrowBatchReader.readVectorizedBatch(vsr)), recycler);
+            this.arrowRowType = arrowRowType;
+            this.vsr = vsr;
+            this.batchRecycler = recycler;
+            this.startPosition = startPosition;
+            reset(startPosition);
+        }
+
+        @Override
+        public ArrowBundleRecords arrowBundle() {
+            return new ArrowBundleRecords(vsr, arrowRowType, true);
+        }
+
+        @Override
+        public ColumnarRowIterator assignRowTracking(
+                Long firstRowId, Long snapshotId, Map<String, Integer> meta) {
+            ColumnarRowIterator fallback = vectorizedFallback();
+            if (firstRowId != null && meta.containsKey(SpecialFields.ROW_ID.name())) {
+                fallback =
+                        new ColumnarRowIterator(
+                                filePath, new ColumnarRow(fallback.batch()), batchRecycler);
+                fallback.reset(startPosition);
+            }
+            return fallback.assignRowTracking(firstRowId, snapshotId, meta);
+        }
+
+        private VectorizedRowIterator vectorizedFallback() {
+            ColumnVector[] columns = batch().columns.clone();
+            VectorizedColumnBatch copiedBatch = batch().copy(columns);
+            VectorizedRowIterator iterator =
+                    new VectorizedRowIterator(
+                            filePath, new ColumnarRow(copiedBatch), batchRecycler);
+            iterator.reset(startPosition);
+            return iterator;
+        }
     }
 }
