@@ -75,7 +75,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
                 MosaicWriter::new);
     }
 
-    protected MosaicRecordsWriter(
+    MosaicRecordsWriter(
             OutputStream outputStream,
             RowType rowType,
             FileFormatFactory.FormatContext formatContext,
@@ -335,7 +335,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
 
     /** Creates the native writer using the allocator owned by the records writer. */
     @FunctionalInterface
-    protected interface NativeWriterFactory {
+    interface NativeWriterFactory {
 
         MosaicWriter create(
                 OutputStream outputStream,
