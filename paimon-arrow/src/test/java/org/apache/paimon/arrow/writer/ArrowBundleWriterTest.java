@@ -47,7 +47,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -789,6 +791,63 @@ public class ArrowBundleWriterTest {
     }
 
     @Test
+    public void testUnselectedArrayAndMapBulkWritesUseLogicalOffsets() throws IOException {
+        RowType rowType =
+                RowType.of(
+                        DataTypes.ARRAY(DataTypes.INT()),
+                        DataTypes.MAP(DataTypes.INT(), DataTypes.INT()));
+        ArrowFormatCWriter cWriter = new ArrowFormatCWriter(rowType, 1024, true);
+        CapturingNativeWriter nativeWriter =
+                new CapturingNativeWriter(cWriter.getVectorSchemaRoot(), cWriter);
+        ArrowBundleWriter writer =
+                new ArrowBundleWriter(new NoOpPositionOutputStream(), cWriter, nativeWriter);
+
+        HeapIntVector elements = new HeapIntVector(6);
+        for (int i = 0; i < 6; i++) {
+            elements.setInt(i, 900 + i);
+        }
+        elements.setInt(2, 10);
+        elements.setInt(5, 20);
+        HeapArrayVector arrays = new HeapArrayVector(2, elements);
+        arrays.putOffsetLength(0, 2, 1);
+        arrays.putOffsetLength(1, 5, 1);
+
+        HeapIntVector keys = new HeapIntVector(5);
+        HeapIntVector values = new HeapIntVector(5);
+        for (int i = 0; i < 5; i++) {
+            keys.setInt(i, 90 + i);
+            values.setInt(i, 900 + i);
+        }
+        keys.setInt(1, 1);
+        keys.setInt(4, 2);
+        values.setInt(1, 10);
+        values.setInt(4, 20);
+        HeapMapVector maps = new HeapMapVector(2, keys, values);
+        maps.putOffsetLength(0, 1, 1);
+        maps.putOffsetLength(1, 4, 1);
+
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {arrays, maps});
+        batch.setNumRows(2);
+        writer.add(batch, null);
+        writer.close();
+
+        assertThat(nativeWriter.snapshots).hasSize(1);
+        CapturingNativeWriter.Snapshot snapshot = nativeWriter.snapshots.get(0);
+        assertThat(snapshot.objectColumns.get(0))
+                .containsExactly(Collections.singletonList(10), Collections.singletonList(20));
+        Map<String, Integer> firstMapEntry = new HashMap<>();
+        firstMapEntry.put("key", 1);
+        firstMapEntry.put("value", 10);
+        Map<String, Integer> secondMapEntry = new HashMap<>();
+        secondMapEntry.put("key", 2);
+        secondMapEntry.put("value", 20);
+        assertThat(snapshot.objectColumns.get(1))
+                .containsExactly(
+                        Collections.singletonList(firstMapEntry),
+                        Collections.singletonList(secondMapEntry));
+    }
+
+    @Test
     public void testMultipleBatchesWithRowType() throws IOException {
         RowType innerRowType = RowType.of(DataTypes.INT(), DataTypes.INT());
         RowType rowType = RowType.of(innerRowType);
@@ -832,6 +891,77 @@ public class ArrowBundleWriterTest {
         assertThat(nativeWriter.snapshots).hasSize(2);
         assertThat(nativeWriter.snapshots.get(0).rowCount).isEqualTo(2);
         assertThat(nativeWriter.snapshots.get(1).rowCount).isEqualTo(2);
+    }
+
+    @Test
+    public void testNullParentSkipsHiddenNotNullArrayAndMapValues() throws IOException {
+        RowType nested =
+                RowType.builder()
+                        .field("arr", DataTypes.ARRAY(DataTypes.INT().notNull()))
+                        .field(
+                                "map",
+                                DataTypes.MAP(DataTypes.INT().notNull(), DataTypes.INT().notNull()))
+                        .build();
+        RowType type = RowType.builder().field("parent", nested).build();
+        HeapIntVector values = new HeapIntVector(2);
+        values.setNullAt(0);
+        values.setInt(1, 42);
+        HeapArrayVector arrays = new HeapArrayVector(2, values);
+        arrays.putOffsetLength(0, 0, 1);
+        arrays.putOffsetLength(1, 1, 1);
+        HeapMapVector maps = new HeapMapVector(2, values, values);
+        maps.putOffsetLength(0, 0, 1);
+        maps.putOffsetLength(1, 1, 1);
+        HeapRowVector parents = new HeapRowVector(2, arrays, maps);
+        parents.setNullAt(0);
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {parents});
+        batch.setNumRows(2);
+        for (int[] selection : new int[][] {null, {1, 0, 1}}) {
+            ArrowFormatCWriter cWriter = new ArrowFormatCWriter(type, 16, true);
+            CapturingNativeWriter nativeWriter =
+                    new CapturingNativeWriter(cWriter.getVectorSchemaRoot(), cWriter);
+            try (ArrowBundleWriter writer =
+                    new ArrowBundleWriter(new NoOpPositionOutputStream(), cWriter, nativeWriter)) {
+                writer.writeBundle(new VectorizedBundleRecords(batch, selection));
+            }
+            Map<String, Object> expected = new HashMap<>();
+            expected.put("arr", Collections.singletonList(42));
+            Map<String, Object> entry = new HashMap<>();
+            entry.put("key", 42);
+            entry.put("value", 42);
+            expected.put("map", Collections.singletonList(entry));
+            List<Object> output = nativeWriter.snapshots.get(0).objectColumns.get(0);
+            assertThat(output)
+                    .containsExactlyElementsOf(
+                            selection == null
+                                    ? Arrays.asList(null, expected)
+                                    : Arrays.asList(expected, null, expected));
+        }
+    }
+
+    @Test
+    public void testVisibleNotNullArrayValueUnderNullableRowIsRejected() throws IOException {
+        RowType type =
+                RowType.builder()
+                        .field(
+                                "parent",
+                                RowType.builder()
+                                        .field("arr", DataTypes.ARRAY(DataTypes.INT().notNull()))
+                                        .build())
+                        .build();
+        HeapIntVector values = new HeapIntVector(2);
+        values.setNullAt(0);
+        values.setNullAt(1);
+        HeapArrayVector arrays = new HeapArrayVector(2, values);
+        arrays.putOffsetLength(0, 0, 1);
+        arrays.putOffsetLength(1, 1, 1);
+        HeapRowVector parents = new HeapRowVector(2, arrays);
+        parents.setNullAt(0);
+        try (ArrowFormatWriter writer = new ArrowFormatWriter(type, 16, true)) {
+            assertThatThrownBy(() -> writer.write(new ColumnVector[] {parents}, null, 0, 2))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("expected not null");
+        }
     }
 
     private static class CapturingNativeWriter extends NativeWriter {
