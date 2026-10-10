@@ -66,29 +66,39 @@ class MosaicRowTrackingTest {
     void directDecorationDoesNotExposePositionDependentVectors() throws Exception {
         checkRowIds(false, false, true);
         checkRowIds(true, false, true);
+        checkRowIds(false, false, true, false, true);
+        checkRowIds(true, false, true, false, true);
     }
 
     @Test
     void synthesizedRowIdsRemainCorrectAfterReorderedProjection() throws Exception {
-        checkRowIds(true, false, false, true);
+        checkRowIds(true, false, false, true, false);
     }
 
     private void checkRowIds(boolean deletion, boolean forceRowFallback, boolean directDecoration)
             throws Exception {
-        checkRowIds(deletion, forceRowFallback, directDecoration, false);
+        checkRowIds(deletion, forceRowFallback, directDecoration, false, false);
     }
 
     private void checkRowIds(
             boolean deletion,
             boolean forceRowFallback,
             boolean directDecoration,
-            boolean reorderedProjection)
+            boolean reorderedProjection,
+            boolean incompatibleProjection)
             throws Exception {
         RowType type =
                 RowType.builder()
                         .field("id", DataTypes.INT())
                         .field(SpecialFields.ROW_ID.name(), DataTypes.BIGINT())
                         .build();
+        RowType projectedType =
+                incompatibleProjection
+                        ? RowType.builder()
+                                .field("id", DataTypes.INT())
+                                .field(SpecialFields.ROW_ID.name(), DataTypes.BIGINT().notNull())
+                                .build()
+                        : type;
         RootAllocator allocator = new RootAllocator();
         VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(type, allocator);
         root.allocateNew();
@@ -110,14 +120,15 @@ class MosaicRowTrackingTest {
                         mock(MosaicInputFileAdapter.class),
                         0,
                         type,
-                        type,
+                        projectedType,
                         null,
                         path,
                         allocator,
                         (file, size, alloc) -> nativeReader);
         int[] indexMapping = reorderedProjection ? new int[] {1, 0} : new int[] {0, 1};
         int rowIdIndex = reorderedProjection ? 0 : 1;
-        RowType outputType = reorderedProjection ? type.project(indexMapping) : type;
+        RowType outputType =
+                reorderedProjection ? projectedType.project(indexMapping) : projectedType;
         try (DataFileRecordReader dataReader =
                         new DataFileRecordReader(
                                 outputType,

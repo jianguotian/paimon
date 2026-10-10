@@ -241,7 +241,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
      * schema and allocator compatibility for the native implementation it uses. Ownership remains
      * with the caller, which must keep the batch alive until this method returns.
      */
-    private void writeArrowBatch(VectorSchemaRoot root) {
+    protected final void writeArrowBatch(VectorSchemaRoot root) {
         checkNotFailed();
         flush();
         try {
