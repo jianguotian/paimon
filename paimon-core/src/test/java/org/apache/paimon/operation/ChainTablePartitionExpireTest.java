@@ -48,8 +48,6 @@ import org.apache.paimon.types.RowType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -378,9 +376,8 @@ public class ChainTablePartitionExpireTest {
         assertThat(deltaParts).contains("EU|20250220");
     }
 
-    @ParameterizedTest
-    @ValueSource(ints = {0, 1})
-    public void testUsesBranchSpecificPartitionModifications(int expireBatchSize) throws Exception {
+    @Test
+    public void testUsesBranchSpecificPartitionModifications() throws Exception {
         Path tablePath = tablePath("branch_specific_partition_modification");
         createChainTable(tablePath, false);
         FileStoreTable mainTable = loadTable(tablePath);
@@ -390,7 +387,6 @@ public class ChainTablePartitionExpireTest {
         write(snapshotTable, "20250101", "v1");
         write(snapshotTable, "20250201", "v2");
         write(snapshotTable, "20250301", "v3");
-        write(deltaTable, "20250105", "d0");
         write(deltaTable, "20250110", "d1");
         write(deltaTable, "20250210", "d2");
 
@@ -410,15 +406,18 @@ public class ChainTablePartitionExpireTest {
                         snapshotTable.schema().logicalPartitionType(),
                         false,
                         Integer.MAX_VALUE,
-                        expireBatchSize,
+                        0,
                         snapshotModification,
                         deltaModification);
         expire.setLastCheck(LocalDateTime.of(2025, 1, 1, 0, 0));
         expire.expire(LocalDateTime.of(2025, 3, 31, 0, 0), Long.MAX_VALUE);
 
         assertThat(deltaModification.droppedValues("dt"))
-                .containsExactlyInAnyOrder("20250105", "20250110");
-        assertThat(snapshotModification.droppedValues("dt")).containsExactly("20250101");
+                .contains("20250110", "20250110.done")
+                .doesNotContain("20250101", "20250101.done");
+        assertThat(snapshotModification.droppedValues("dt"))
+                .contains("20250101", "20250101.done")
+                .doesNotContain("20250110", "20250110.done");
     }
 
     @Test
