@@ -18,10 +18,13 @@
 
 package org.apache.paimon.format.mosaic;
 
+import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.reader.ArrowBatchReader;
+import org.apache.paimon.arrow.reader.ArrowVectorizedRecordIterator;
 import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.PartitionInfo;
 import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.ColumnarRow;
 import org.apache.paimon.data.columnar.ColumnarRowIterator;
@@ -77,8 +80,10 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     private final BufferAllocator allocator;
     private final int numRowGroups;
     private final RowType dataSchemaRowType;
+    private final RowType projectedRowType;
     private final int projectedFieldCount;
     private final boolean allProjectedColumnsMissing;
+    private final boolean arrowBundleCompatible;
     @Nullable private final List<Predicate> predicates;
     @Nullable private final RoaringBitmap32 selection;
 
@@ -213,6 +218,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         this.filePath = filePath;
         this.inputFileAdapter = inputFileAdapter;
         this.dataSchemaRowType = dataSchemaRowType;
+        this.projectedRowType = projectedRowType;
         this.projectedFieldCount = projectedRowType.getFieldCount();
         this.predicates = predicates;
         this.selection = selection;
@@ -238,7 +244,12 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
                 }
             }
             createdAllProjectedColumnsMissing = existingColumns.isEmpty();
-            if (!existingColumns.isEmpty()) {
+            this.arrowBundleCompatible =
+                    existingColumns.size() == projectedFieldCount
+                            && MosaicArrowProjection.matchesProjection(
+                                    projectedRowType, fileSchema);
+            if (!existingColumns.isEmpty()
+                    && !hasExactProjection(projectedNames, fileSchema.getFields())) {
                 createdReader.project(existingColumns.toArray(new String[0]));
             }
 
@@ -329,6 +340,15 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             }
             if (allProjectedColumnsMissing) {
                 return allNullIterator(batch.startPosition, batch.numRows);
+            }
+            if (arrowBundleCompatible) {
+                return new MosaicArrowVectorizedRecordIterator(
+                        filePath,
+                        batch.startPosition,
+                        projectedRowType,
+                        arrowBatchReader,
+                        vsr,
+                        recycler);
             }
             return new MosaicVectorizedRecordIterator(
                     filePath,
@@ -567,6 +587,18 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         }
     }
 
+    private static boolean hasExactProjection(List<String> projectedNames, List<Field> fileFields) {
+        if (projectedNames.size() != fileFields.size()) {
+            return false;
+        }
+        for (int i = 0; i < projectedNames.size(); i++) {
+            if (!projectedNames.get(i).equals(fileFields.get(i).getName())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void releaseActiveBatches() {
         Throwable failure = null;
         synchronized (batchLock) {
@@ -783,6 +815,48 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             }
             fallback.reset(startPosition);
             return fallback.assignRowTracking(firstRowId, snapshotId, meta);
+        }
+    }
+
+    private static class MosaicArrowVectorizedRecordIterator extends MosaicVectorizedRecordIterator
+            implements ArrowVectorizedRecordIterator {
+
+        private final RowType arrowRowType;
+        private final VectorSchemaRoot vsr;
+
+        private MosaicArrowVectorizedRecordIterator(
+                Path filePath,
+                long startPosition,
+                RowType arrowRowType,
+                ArrowBatchReader arrowBatchReader,
+                VectorSchemaRoot vsr,
+                BatchRecycler recycler) {
+            super(filePath, startPosition, arrowBatchReader.readVectorizedBatch(vsr), recycler);
+            this.arrowRowType = arrowRowType;
+            this.vsr = vsr;
+        }
+
+        @Override
+        public ColumnarRowIterator mapping(
+                @Nullable PartitionInfo partitionInfo, @Nullable int[] indexMapping) {
+            if (partitionInfo == null
+                    && indexMapping != null
+                    && indexMapping.length == batch().columns.length) {
+                for (int i = 0; i < indexMapping.length; i++) {
+                    if (indexMapping[i] != i) {
+                        return super.mapping(partitionInfo, indexMapping);
+                    }
+                }
+                return this;
+            }
+            return super.mapping(partitionInfo, indexMapping);
+        }
+
+        @Override
+        public ArrowBundleRecords arrowBundle() {
+            checkArgument(
+                    returnedPositionIndex == 0, "arrowBundle() should not be called after next()");
+            return new ArrowBundleRecords(vsr, arrowRowType, true);
         }
     }
 }
