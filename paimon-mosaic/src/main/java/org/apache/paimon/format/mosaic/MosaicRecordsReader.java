@@ -77,7 +77,6 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     private final BufferAllocator allocator;
     private final int numRowGroups;
     private final RowType dataSchemaRowType;
-    private final RowType projectedRowType;
     private final int projectedFieldCount;
     private final boolean allProjectedColumnsMissing;
     @Nullable private final List<Predicate> predicates;
@@ -214,7 +213,6 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
         this.filePath = filePath;
         this.inputFileAdapter = inputFileAdapter;
         this.dataSchemaRowType = dataSchemaRowType;
-        this.projectedRowType = projectedRowType;
         this.projectedFieldCount = projectedRowType.getFieldCount();
         this.predicates = predicates;
         this.selection = selection;
