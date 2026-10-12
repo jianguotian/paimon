@@ -39,6 +39,8 @@ import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Collections;
 
@@ -68,21 +70,24 @@ class MosaicRowTrackingTest {
         checkRowIds(true, false, true);
     }
 
-    @Test
-    void synthesizedRowIdsRemainCorrectAfterReorderedProjection() throws Exception {
-        checkRowIds(true, false, false, true);
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1})
+    void synthesizedRowIdsRemainCorrectAfterReorderedProjection(int rowGroupIndex)
+            throws Exception {
+        checkRowIds(true, false, false, true, rowGroupIndex);
     }
 
     private void checkRowIds(boolean deletion, boolean forceRowFallback, boolean directDecoration)
             throws Exception {
-        checkRowIds(deletion, forceRowFallback, directDecoration, false);
+        checkRowIds(deletion, forceRowFallback, directDecoration, false, 0);
     }
 
     private void checkRowIds(
             boolean deletion,
             boolean forceRowFallback,
             boolean directDecoration,
-            boolean reorderedProjection)
+            boolean reorderedProjection,
+            int rowGroupIndex)
             throws Exception {
         RowType type =
                 RowType.builder()
@@ -90,20 +95,20 @@ class MosaicRowTrackingTest {
                         .field(SpecialFields.ROW_ID.name(), DataTypes.BIGINT())
                         .build();
         RootAllocator allocator = new RootAllocator();
-        VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(type, allocator);
-        root.allocateNew();
-        ((IntVector) root.getVector(0)).setSafe(0, 7);
-        ((IntVector) root.getVector(0)).setSafe(1, 8);
-        ((IntVector) root.getVector(0)).setSafe(2, 9);
-        ((BigIntVector) root.getVector(1)).setNull(0);
-        ((BigIntVector) root.getVector(1)).setNull(1);
-        ((BigIntVector) root.getVector(1)).setNull(2);
-        root.setRowCount(3);
         MosaicReader nativeReader = mock(MosaicReader.class);
-        when(nativeReader.getSchema()).thenReturn(root.getSchema());
-        when(nativeReader.numRowGroups()).thenReturn(1);
-        when(nativeReader.rowGroupNumRows(0)).thenReturn(3);
-        when(nativeReader.readRowGroup(0, allocator)).thenReturn(root);
+        when(nativeReader.numRowGroups()).thenReturn(rowGroupIndex + 1);
+        for (int group = 0; group <= rowGroupIndex; group++) {
+            VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(type, allocator);
+            root.allocateNew();
+            for (int row = 0; row < 3; row++) {
+                ((IntVector) root.getVector(0)).setSafe(row, 7 + group * 3 + row);
+                ((BigIntVector) root.getVector(1)).setNull(row);
+            }
+            root.setRowCount(3);
+            when(nativeReader.getSchema()).thenReturn(root.getSchema());
+            when(nativeReader.rowGroupNumRows(group)).thenReturn(3);
+            when(nativeReader.readRowGroup(group, allocator)).thenReturn(root);
+        }
         Path path = new Path("file:/tmp/pr9-review");
         MosaicRecordsReader reader =
                 new MosaicRecordsReader(
@@ -136,6 +141,19 @@ class MosaicRowTrackingTest {
                 RootAllocator outputAllocator = new RootAllocator();
                 VectorSchemaRoot output =
                         ArrowUtils.createVectorSchemaRoot(outputType, outputAllocator)) {
+            for (int group = 0; group < rowGroupIndex; group++) {
+                FileRecordIterator<InternalRow> previousBatch = dataReader.readBatch();
+                try {
+                    for (int row = 0; row < 3; row++) {
+                        assertThat(previousBatch.next().getLong(rowIdIndex))
+                                .isEqualTo(1000L + group * 3 + row);
+                    }
+                    assertThat(previousBatch.next()).isNull();
+                } finally {
+                    previousBatch.releaseBatch();
+                }
+            }
+            long startPosition = rowGroupIndex * 3L;
             FileRecordIterator<InternalRow> batch =
                     directDecoration
                             ? ((ColumnarRowIterator) reader.readBatch())
@@ -153,7 +171,8 @@ class MosaicRowTrackingTest {
                                 output, ArrowUtils.createArrowFieldWriters(output, outputType));
                 if (deletion) {
                     vectorConverter.reset(
-                            new ApplyDeletionFileRecordIterator(batch, pos -> pos == 1));
+                            new ApplyDeletionFileRecordIterator(
+                                    batch, pos -> pos == startPosition + 1));
                 } else {
                     vectorConverter.reset((VectorizedRecordIterator) batch);
                 }
@@ -164,7 +183,8 @@ class MosaicRowTrackingTest {
                                 output, ArrowUtils.createArrowFieldWriters(output, outputType));
                 rowConverter.reset(
                         deletion
-                                ? new ApplyDeletionFileRecordIterator(batch, pos -> pos == 1)
+                                ? new ApplyDeletionFileRecordIterator(
+                                        batch, pos -> pos == startPosition + 1)
                                 : batch);
                 converter = rowConverter;
             }
@@ -177,8 +197,12 @@ class MosaicRowTrackingTest {
             assertThat(observed)
                     .containsExactly(
                             deletion
-                                    ? new long[] {1000L, 1002L}
-                                    : new long[] {1000L, 1001L, 1002L});
+                                    ? new long[] {1000L + startPosition, 1002L + startPosition}
+                                    : new long[] {
+                                        1000L + startPosition,
+                                        1001L + startPosition,
+                                        1002L + startPosition
+                                    });
         }
     }
 }

@@ -36,6 +36,8 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
@@ -405,18 +407,38 @@ class MosaicRecordsWriterTest {
         }
     }
 
-    @Test
-    void testNativeWriteFailureIsNotRetriedDuringClose() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testNativeWriteFailureIsNotRetriedDuringClose(boolean directWrite) throws Exception {
         RowType type = RowType.builder().field("a", DataTypes.INT()).build();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
         RuntimeException failure = new RuntimeException("native write failed");
         doThrow(failure).when(nativeWriter).write(any(VectorSchemaRoot.class));
-        MosaicRecordsWriter writer = createWriter(type, new RootAllocator(), nativeWriter);
-        writer.addElement(GenericRow.of(1));
-        assertThatThrownBy(writer::flush).isSameAs(failure);
-        assertThatThrownBy(() -> writer.addElement(GenericRow.of(2)))
-                .isInstanceOf(IllegalStateException.class);
-        writer.close();
+        CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+        try (MosaicRecordsWriter writer = createWriter(type, allocator, nativeWriter)) {
+            try (BufferAllocator sourceAllocator =
+                            allocator.newChildAllocator("mosaic-failure-test", 0, Long.MAX_VALUE);
+                    VectorSchemaRoot root =
+                            ArrowUtils.createVectorSchemaRoot(type, sourceAllocator)) {
+                setInt((IntVector) root.getVector("a"), 1);
+                root.setRowCount(1);
+                ArrowBundleRecords bundle = new ArrowBundleRecords(root, type, true);
+                if (directWrite) {
+                    assertThatThrownBy(() -> writer.writeBundle(bundle)).isSameAs(failure);
+                    verify(nativeWriter).write(same(root));
+                } else {
+                    writer.addElement(GenericRow.of(1));
+                    assertThatThrownBy(writer::flush).isSameAs(failure);
+                }
+                assertThatThrownBy(() -> writer.addElement(GenericRow.of(2)))
+                        .isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(() -> writer.writeBundle(bundle))
+                        .isInstanceOf(IllegalStateException.class);
+            }
+        }
         verify(nativeWriter, times(1)).write(any(VectorSchemaRoot.class));
+        verify(nativeWriter).close();
+        assertThat(allocator.closeCount()).isEqualTo(1);
+        assertThat(allocator.getAllocatedMemory()).isZero();
     }
 }
