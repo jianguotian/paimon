@@ -24,6 +24,7 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.columnar.AllNullColumnVector;
 import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.data.columnar.heap.HeapArrayVector;
@@ -54,6 +55,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
@@ -658,11 +660,42 @@ class MosaicColumnBatchWriterTest {
     }
 
     @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void testNativeWriterRejectsNullsInNotNullColumn(boolean selected, boolean allNull)
+            throws Exception {
+        RowType type = RowType.builder().field("id", DataTypes.INT().notNull()).build();
+        HeapIntVector values = heapInts(7, 8);
+        values.setNullAt(1);
+        VectorizedColumnBatch batch =
+                new VectorizedColumnBatch(
+                        new ColumnVector[] {allNull ? AllNullColumnVector.INSTANCE : values});
+        batch.setNumRows(2);
+        try (MosaicRecordsWriter writer =
+                new MosaicRecordsWriter(
+                        new ByteArrayOutputStream(),
+                        type,
+                        FORMAT_CONTEXT,
+                        Collections.emptyList(),
+                        null)) {
+            assertThatThrownBy(
+                            () ->
+                                    writer.writeBundle(
+                                            new VectorizedBundleRecords(
+                                                    batch, selected ? new int[] {1} : null)))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Field 'id' expected not null but found null value");
+            assertThatThrownBy(() -> writer.addElement(GenericRow.of(99)))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("Mosaic writer has failed");
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void testNativeRoundTripWithMixedRowsAndColumnBatches(boolean selected) throws Exception {
         RowType type =
                 RowType.builder()
-                        .field("id", DataTypes.INT())
+                        .field("id", DataTypes.INT().notNull())
                         .field("s", DataTypes.STRING())
                         .build();
         Options options = new Options();
