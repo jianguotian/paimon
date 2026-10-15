@@ -838,8 +838,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
 
         @Override
         public ArrowBundleRecords arrowBundle() {
-            checkArgument(
-                    returnedPositionIndex == 0, "arrowBundle() should not be called after next()");
+            checkArgument(index == 0, "arrowBundle() should not be called after next()");
             return new ArrowBundleRecords(vsr, arrowRowType, true);
         }
     }

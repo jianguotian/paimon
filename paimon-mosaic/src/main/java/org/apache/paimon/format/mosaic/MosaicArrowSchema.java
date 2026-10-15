@@ -32,11 +32,11 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /** Exact field-layout checks for exposing and writing original Mosaic Arrow batches. */
-public final class MosaicArrowSchema {
+final class MosaicArrowSchema {
 
     private MosaicArrowSchema() {}
 
-    public static boolean matches(RowType expected, Schema actual) {
+    static boolean matches(RowType expected, Schema actual) {
         return matchesFields(
                 expected.getFields().stream()
                         .map(f -> ArrowUtils.toArrowField(f.name(), f.id(), f.type(), 0))
@@ -44,7 +44,7 @@ public final class MosaicArrowSchema {
                 actual.getFields());
     }
 
-    public static boolean matches(Schema expected, Schema actual) {
+    static boolean matches(Schema expected, Schema actual) {
         return matchesFields(expected.getFields(), actual.getFields());
     }
 

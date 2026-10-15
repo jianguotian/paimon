@@ -183,8 +183,17 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         if (bundleRecords instanceof ArrowBundleRecords) {
             ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
             VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
-            if (arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle)
-                    && ArrowUtils.hasSameRootAllocator(root, allocator)) {
+            if (root.getRowCount() == 0) {
+                return;
+            }
+            // Mosaic 0.3 exports through the input allocator. It may differ from this writer's
+            // allocator, but all vectors in the input batch must share one root allocator.
+            if (arrowBundle.hasIdentityMapping()
+                    && rowType.equals(arrowBundle.getRowType())
+                    && MosaicArrowSchema.matches(
+                            arrowFormatWriter.getVectorSchemaRoot().getSchema(), root.getSchema())
+                    && !root.getFieldVectors().isEmpty()
+                    && ArrowUtils.hasSameRootAllocator(root, root.getVector(0).getAllocator())) {
                 writeArrowBatch(root);
                 return;
             }
@@ -268,7 +277,7 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
      * schema and allocator compatibility for the native implementation it uses. Ownership remains
      * with the caller, which must keep the batch alive until this method returns.
      */
-    protected final void writeArrowBatch(VectorSchemaRoot root) {
+    private void writeArrowBatch(VectorSchemaRoot root) {
         checkNotFailed();
         flush();
         try {

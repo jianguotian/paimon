@@ -94,10 +94,10 @@ class MosaicColumnBatchReaderTest {
         assertThat(arrowRecords.arrowBundle().getVectorSchemaRoot()).isSameAs(root);
         assertThat(arrowRecords.batch().getNumRows()).isEqualTo(3);
         assertThat(records.next().getInt(0)).isEqualTo(10);
-        assertThat(records.returnedPosition()).isZero();
         assertThatThrownBy(arrowRecords::arrowBundle)
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("after next()");
+        assertThat(records.returnedPosition()).isZero();
         records.releaseBatch();
         records.releaseBatch();
         assertThat(allocator.getAllocatedMemory()).isZero();
