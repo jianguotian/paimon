@@ -116,10 +116,31 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
 
     @Override
     public void writeBundle(BundleRecords bundle) throws IOException {
-        if (auxiliaryFileWriters.isEmpty()
+        boolean canWriteIndexes =
+                bundle instanceof VectorizedBundleRecords
+                        && auxiliaryFileWriters.stream()
+                                .allMatch(writer -> writer instanceof DataFileIndexAuxiliaryWriter);
+        if ((auxiliaryFileWriters.isEmpty() || canWriteIndexes)
                 && sequenceNumberTracker.supportsRowCountUpdate()
                 && !requiresPerRecordStats()) {
             long rowCount = bundle.rowCount();
+            if (!auxiliaryFileWriters.isEmpty()) {
+                if (closed) {
+                    throw new RuntimeException("Writer has already closed!");
+                }
+                // Vectorized bundles expose repeatable row views without consuming the batch.
+                // Read index fields before the format writer may transfer the borrowed buffers.
+                try {
+                    for (InternalRow row : bundle) {
+                        for (DataFileAuxiliaryWriter auxiliaryFileWriter : auxiliaryFileWriters) {
+                            auxiliaryFileWriter.write(row);
+                        }
+                    }
+                } catch (Throwable e) {
+                    abort();
+                    throw e;
+                }
+            }
             super.writeBundle(bundle);
             sequenceNumberTracker.updateByRowCount(rowCount);
             return;

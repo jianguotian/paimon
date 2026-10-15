@@ -21,22 +21,31 @@ package org.apache.paimon.io;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.columnar.ColumnVector;
+import org.apache.paimon.data.columnar.VectorizedColumnBatch;
+import org.apache.paimon.data.columnar.heap.HeapIntVector;
+import org.apache.paimon.fileindex.FileIndexFormat;
 import org.apache.paimon.fileindex.FileIndexOptions;
+import org.apache.paimon.fileindex.FileIndexReader;
+import org.apache.paimon.fileindex.bitmap.BitmapIndexResult;
 import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.format.FormatWriterFactory;
 import org.apache.paimon.format.SimpleColStats;
 import org.apache.paimon.format.SupportsDirectWrite;
+import org.apache.paimon.fs.ByteArraySeekableStream;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.predicate.FieldRef;
 import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.LongCounter;
+import org.apache.paimon.utils.RoaringBitmap32;
 
 import org.junit.jupiter.api.Test;
 
@@ -45,9 +54,12 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 
+import static org.apache.paimon.io.DataFilePathFactory.dataFileToFileIndexPath;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -224,9 +236,9 @@ class RowDataFileWriterTest {
                         formatWriter,
                         statsProducer,
                         sequenceCounter,
-                        new FileIndexOptions());
+                        bitmapOptions());
 
-        writer.writeBundle(rows(GenericRow.of(1), GenericRow.of(2)));
+        writer.writeBundle(vectorizedRows(1, 2));
 
         assertThat(formatWriter.bundleWrites).isZero();
         assertThat(formatWriter.rowWrites).isEqualTo(2);
@@ -289,6 +301,149 @@ class RowDataFileWriterTest {
     }
 
     @Test
+    void testVectorizedBundlesPreserveBitmapPositions() throws Exception {
+        TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
+        LongCounter sequenceCounter = new LongCounter(5);
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO(),
+                        ROW_TYPE,
+                        formatWriter,
+                        SimpleStatsProducer.disabledProducer(),
+                        sequenceCounter,
+                        bitmapOptions());
+        writer.write(GenericRow.of(1));
+        VectorizedBundleRecords source = vectorizedRows(1, null, 2, 1);
+        writer.writeBundle(new VectorizedBundleRecords(source.batch(), new int[] {2, 0, 1, 2}));
+        writer.writeBundle(vectorizedRows());
+        writer.writeBundle(vectorizedRows(2, 1));
+
+        assertThat(formatWriter.bundleWrites).isEqualTo(3);
+        assertThat(formatWriter.rowWrites).isEqualTo(1);
+        assertThat(writer.recordCount()).isEqualTo(7);
+        assertThat(sequenceCounter.getValue()).isEqualTo(12);
+        writer.close();
+        DataFileMeta result = writer.result();
+        assertThat(result.minSequenceNumber()).isEqualTo(5);
+        assertThat(result.maxSequenceNumber()).isEqualTo(11);
+        try (FileIndexFormat.Reader reader =
+                FileIndexFormat.createReader(
+                        new ByteArraySeekableStream(result.embeddedIndex()), ROW_TYPE)) {
+            FileIndexReader index = reader.readColumnIndex("id").iterator().next();
+            FieldRef field = new FieldRef(0, "id", DataTypes.INT());
+            assertThat(((BitmapIndexResult) index.visitEqual(field, 1)).get())
+                    .isEqualTo(RoaringBitmap32.bitmapOf(0, 2, 6));
+            assertThat(((BitmapIndexResult) index.visitEqual(field, 2)).get())
+                    .isEqualTo(RoaringBitmap32.bitmapOf(1, 4, 5));
+            assertThat(((BitmapIndexResult) index.visitIsNull(field)).get())
+                    .isEqualTo(RoaringBitmap32.bitmapOf(3));
+        }
+    }
+
+    @Test
+    void testIndexedVectorizedBundleAllowsFormatRowFallback() throws Exception {
+        TestingFallbackBundleFormatWriter formatWriter = new TestingFallbackBundleFormatWriter();
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO(),
+                        ROW_TYPE,
+                        formatWriter,
+                        SimpleStatsProducer.disabledProducer(),
+                        new LongCounter(),
+                        bitmapOptions());
+        writer.writeBundle(vectorizedRows(1, 2));
+        assertThat(formatWriter.bundleWrites).isEqualTo(1);
+        assertThat(formatWriter.rowWrites).isEqualTo(2);
+        writer.close();
+        assertThat(writer.result().embeddedIndex()).isNotNull();
+    }
+
+    @Test
+    void testIndexFailureAbortsBeforeWritingBatch() throws Exception {
+        FileIO fileIO = fileIO();
+        TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
+        LongCounter sequenceCounter = new LongCounter(5);
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO,
+                        ROW_TYPE,
+                        formatWriter,
+                        SimpleStatsProducer.disabledProducer(),
+                        sequenceCounter,
+                        bitmapOptions());
+        RuntimeException failure = new RuntimeException("index field access failed");
+        HeapIntVector vector =
+                new HeapIntVector(2) {
+                    @Override
+                    public int getInt(int rowId) {
+                        if (rowId == 1) {
+                            throw failure;
+                        }
+                        return 1;
+                    }
+                };
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+        batch.setNumRows(2);
+        assertThatThrownBy(() -> writer.writeBundle(new VectorizedBundleRecords(batch, null)))
+                .isSameAs(failure);
+        assertThat(formatWriter.bundleWrites).isZero();
+        assertThat(formatWriter.closeCalls).isEqualTo(1);
+        assertThat(writer.recordCount()).isZero();
+        assertThat(sequenceCounter.getValue()).isEqualTo(5);
+        verify(fileIO).deleteQuietly(PATH);
+        verify(fileIO, atLeastOnce()).deleteQuietly(dataFileToFileIndexPath(PATH));
+    }
+
+    @Test
+    void testClosedWriterRejectsBundleBeforeReadingIndexFields() throws Exception {
+        FileIO fileIO = fileIO();
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO,
+                        ROW_TYPE,
+                        new TestingBundleFormatWriter(),
+                        SimpleStatsProducer.disabledProducer(),
+                        new LongCounter(),
+                        bitmapOptions());
+        writer.close();
+        VectorizedBundleRecords bundle =
+                new VectorizedBundleRecords(vectorizedRows(1).batch(), null) {
+                    @Override
+                    public Iterator<InternalRow> iterator() {
+                        throw new AssertionError("Closed writer must not consume the index batch");
+                    }
+                };
+        assertThatThrownBy(() -> writer.writeBundle(bundle))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessage("Writer has already closed!");
+        verify(fileIO, never()).deleteQuietly(PATH);
+        verify(fileIO, never()).deleteQuietly(dataFileToFileIndexPath(PATH));
+    }
+
+    @Test
+    void testBundleFailureAlsoAbortsPreparedIndex() throws Exception {
+        FileIO fileIO = fileIO();
+        IOException failure = new IOException("bundle write failed");
+        TestingThrowingBundleFormatWriter formatWriter =
+                new TestingThrowingBundleFormatWriter(failure);
+        LongCounter sequenceCounter = new LongCounter(5);
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO,
+                        ROW_TYPE,
+                        formatWriter,
+                        SimpleStatsProducer.disabledProducer(),
+                        sequenceCounter,
+                        bitmapOptions());
+        assertThatThrownBy(() -> writer.writeBundle(vectorizedRows(1, 2))).isSameAs(failure);
+        assertThat(formatWriter.closeCalls).isEqualTo(1);
+        assertThat(writer.recordCount()).isZero();
+        assertThat(sequenceCounter.getValue()).isEqualTo(5);
+        verify(fileIO).deleteQuietly(PATH);
+        verify(fileIO, atLeastOnce()).deleteQuietly(dataFileToFileIndexPath(PATH));
+    }
+
+    @Test
     void testRowSidecarFallsBackToRows() throws Exception {
         FileIO fileIO = fileIO();
         TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
@@ -304,11 +459,11 @@ class RowDataFileWriterTest {
                         formatWriter,
                         SimpleStatsProducer.disabledProducer(),
                         new LongCounter(),
-                        new FileIndexOptions(),
+                        bitmapOptions(),
                         rowSidecarFormat,
                         rowSidecarPath);
 
-        writer.writeBundle(rows(GenericRow.of(1), GenericRow.of(2)));
+        writer.writeBundle(vectorizedRows(1, 2));
 
         assertThat(formatWriter.bundleWrites).isZero();
         assertThat(formatWriter.rowWrites).isEqualTo(2);
@@ -322,6 +477,26 @@ class RowDataFileWriterTest {
         FileIO fileIO = mock(FileIO.class);
         when(fileIO.getFileSize(PATH)).thenReturn(123L);
         return fileIO;
+    }
+
+    private static FileIndexOptions bitmapOptions() {
+        Options options = new Options();
+        options.set("file-index.bitmap.columns", "id");
+        return new FileIndexOptions(new CoreOptions(options));
+    }
+
+    private static VectorizedBundleRecords vectorizedRows(Integer... values) {
+        HeapIntVector vector = new HeapIntVector(values.length);
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] == null) {
+                vector.setNullAt(i);
+            } else {
+                vector.setInt(i, values[i]);
+            }
+        }
+        VectorizedColumnBatch batch = new VectorizedColumnBatch(new ColumnVector[] {vector});
+        batch.setNumRows(values.length);
+        return new VectorizedBundleRecords(batch, null);
     }
 
     private static RowDataFileWriter createWriter(
