@@ -43,7 +43,6 @@ import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataFileRecordReader;
 import org.apache.paimon.io.FileWriterContext;
 import org.apache.paimon.io.RollingFileWriter;
-import org.apache.paimon.io.RollingFileWriterImpl;
 import org.apache.paimon.io.RowDataFileWriter;
 import org.apache.paimon.io.VectorizedBundleRecords;
 import org.apache.paimon.manifest.FileSource;
@@ -68,8 +67,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -162,31 +159,19 @@ class MosaicReaderWriterTest {
         assertThat(result.get(1).getString(1).toString()).isEqualTo("world");
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void testColumnBatchRewritePreservesVinBitmap(boolean externalIndex) throws IOException {
-        RowType rowType =
-                RowType.builder()
-                        .field("vin", DataTypes.STRING())
-                        .field("value", DataTypes.INT())
-                        .build();
+    @Test
+    void testColumnBatchRewritePreservesVinBitmap() throws IOException {
+        RowType rowType = RowType.builder().field("vin", DataTypes.STRING()).build();
         Path sourcePath = newPath();
+        Path targetPath = newPath();
         BinaryString a = BinaryString.fromString("A");
         BinaryString b = BinaryString.fromString("B");
-        writeRows(
-                rowType,
-                sourcePath,
-                GenericRow.of(a, 0),
-                GenericRow.of(null, 1),
-                GenericRow.of(b, 2),
-                GenericRow.of(a, 3));
+        writeRows(rowType, sourcePath, GenericRow.of(a), GenericRow.of(b), GenericRow.of(a));
+
         LocalFileIO fileIO = new LocalFileIO();
+        MosaicFileFormat format = createFormat("vin");
         Options options = new Options();
         options.set("file-index.bitmap.columns", "vin");
-        options.set("file-index.in-manifest-threshold", externalIndex ? "0B" : "1MB");
-        FileIndexOptions indexOptions = new FileIndexOptions(new CoreOptions(options));
-        List<Path> paths = new ArrayList<>();
-        LongCounter sequenceCounter = new LongCounter();
         FormatWriterFactory factory =
                 (out, compression) ->
                         new MosaicRecordsWriter(
@@ -201,40 +186,30 @@ class MosaicReaderWriterTest {
                                         "Indexed column batches must not fall back to row writes");
                             }
                         };
-        RollingFileWriterImpl<InternalRow, DataFileMeta> writer =
-                new RollingFileWriterImpl<>(
-                        () -> {
-                            Path path = newPath();
-                            paths.add(path);
-                            return new RowDataFileWriter(
-                                    fileIO,
-                                    new FileWriterContext(
-                                            factory,
-                                            RollingFileWriter.createStatsProducer(
-                                                    createFormat("vin"),
-                                                    rowType,
-                                                    SimpleColStatsCollector
-                                                            .createFullStatsFactories(
-                                                                    rowType.getFieldCount())),
-                                            "zstd"),
-                                    path,
-                                    rowType,
-                                    0L,
-                                    () -> sequenceCounter,
-                                    indexOptions,
-                                    FileSource.COMPACT,
-                                    false,
-                                    false,
-                                    false,
-                                    null,
-                                    null,
-                                    null);
-                        },
-                        Long.MAX_VALUE,
-                        3L);
+        RowDataFileWriter writer =
+                new RowDataFileWriter(
+                        fileIO,
+                        new FileWriterContext(
+                                factory,
+                                RollingFileWriter.createStatsProducer(
+                                        format,
+                                        rowType,
+                                        SimpleColStatsCollector.createFullStatsFactories(1)),
+                                "zstd"),
+                        targetPath,
+                        rowType,
+                        0L,
+                        LongCounter::new,
+                        new FileIndexOptions(new CoreOptions(options)),
+                        FileSource.COMPACT,
+                        false,
+                        false,
+                        false,
+                        null,
+                        null,
+                        null);
         try (RecordReader<InternalRow> reader =
-                createFormat()
-                        .createReaderFactory(rowType, rowType, null)
+                format.createReaderFactory(rowType, rowType, null)
                         .createReader(
                                 new FormatReaderContext(
                                         fileIO,
@@ -242,64 +217,36 @@ class MosaicReaderWriterTest {
                                         fileIO.getFileSize(sourcePath),
                                         null,
                                         null))) {
-            RecordReader.RecordIterator<InternalRow> records = reader.readBatch();
-            try {
-                assertThat(records).isInstanceOf(VectorizedRecordIterator.class);
-                VectorizedRecordIterator batch = (VectorizedRecordIterator) records;
-                assertThat(batch.batch().getNumRows()).isEqualTo(4);
-                writer.writeBundle(new VectorizedBundleRecords(batch.batch(), new int[] {2, 0, 1}));
-                writer.writeBundle(new VectorizedBundleRecords(batch.batch(), new int[] {3, 2, 3}));
-            } finally {
-                records.releaseBatch();
+            RecordReader.RecordIterator<InternalRow> records;
+            while ((records = reader.readBatch()) != null) {
+                try {
+                    assertThat(records).isInstanceOf(VectorizedRecordIterator.class);
+                    writer.writeBundle(
+                            new VectorizedBundleRecords(
+                                    ((VectorizedRecordIterator) records).batch(), null));
+                } finally {
+                    records.releaseBatch();
+                }
             }
-            assertThat(reader.readBatch()).isNull();
         }
         writer.close();
-        List<DataFileMeta> files = writer.result();
-        assertThat(files).hasSize(2);
-        int[][] expectedValues = {{2, 0, 1}, {3, 2, 3}};
-        for (int i = 0; i < files.size(); i++) {
-            DataFileMeta file = files.get(i);
-            assertThat(file.rowCount()).isEqualTo(3);
-            assertThat(file.valueStats().minValues().getString(0)).isEqualTo(a);
-            assertThat(file.valueStats().maxValues().getString(0)).isEqualTo(b);
-            List<InternalRow> rows = readAll(rowType, rowType, paths.get(i), null);
-            assertThat(rows)
-                    .extracting(row -> row.getInt(1))
-                    .containsExactly(
-                            expectedValues[i][0], expectedValues[i][1], expectedValues[i][2]);
-            assertThat(rows)
-                    .extracting(row -> row.isNullAt(0) ? null : row.getString(0))
-                    .containsExactly(i == 0 ? b : a, i == 0 ? a : b, i == 0 ? null : a);
-            if (externalIndex) {
-                assertThat(file.embeddedIndex()).isNull();
-                assertThat(file.extraFiles()).hasSize(1);
-            } else {
-                assertThat(file.embeddedIndex()).isNotNull();
-                assertThat(file.extraFiles()).isEmpty();
-            }
-            try (FileIndexFormat.Reader indexReader =
-                    FileIndexFormat.createReader(
-                            externalIndex
-                                    ? fileIO.newInputStream(
-                                            new Path(
-                                                    paths.get(i).getParent(),
-                                                    file.extraFiles().get(0)))
-                                    : new ByteArraySeekableStream(file.embeddedIndex()),
-                            rowType)) {
-                FileIndexReader index = indexReader.readColumnIndex("vin").iterator().next();
-                FieldRef field = new FieldRef(0, "vin", DataTypes.STRING());
-                assertThat(((BitmapIndexResult) index.visitEqual(field, a)).get())
-                        .isEqualTo(
-                                i == 0
-                                        ? RoaringBitmap32.bitmapOf(1)
-                                        : RoaringBitmap32.bitmapOf(0, 2));
-                assertThat(((BitmapIndexResult) index.visitEqual(field, b)).get())
-                        .isEqualTo(RoaringBitmap32.bitmapOf(i == 0 ? 0 : 1));
-                assertThat(((BitmapIndexResult) index.visitIsNull(field)).get())
-                        .isEqualTo(
-                                i == 0 ? RoaringBitmap32.bitmapOf(2) : RoaringBitmap32.bitmapOf());
-            }
+
+        assertThat(readAll(rowType, rowType, targetPath, null))
+                .extracting(row -> row.getString(0))
+                .containsExactly(a, b, a);
+        DataFileMeta file = writer.result();
+        assertThat(file.rowCount()).isEqualTo(3);
+        assertThat(file.valueStats().minValues().getString(0)).isEqualTo(a);
+        assertThat(file.valueStats().maxValues().getString(0)).isEqualTo(b);
+        try (FileIndexFormat.Reader indexReader =
+                FileIndexFormat.createReader(
+                        new ByteArraySeekableStream(file.embeddedIndex()), rowType)) {
+            FileIndexReader index = indexReader.readColumnIndex("vin").iterator().next();
+            FieldRef field = new FieldRef(0, "vin", DataTypes.STRING());
+            assertThat(((BitmapIndexResult) index.visitEqual(field, a)).get())
+                    .isEqualTo(RoaringBitmap32.bitmapOf(0, 2));
+            assertThat(((BitmapIndexResult) index.visitEqual(field, b)).get())
+                    .isEqualTo(RoaringBitmap32.bitmapOf(1));
         }
     }
 

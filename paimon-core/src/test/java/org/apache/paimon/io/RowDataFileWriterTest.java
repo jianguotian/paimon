@@ -38,6 +38,7 @@ import org.apache.paimon.fs.ByteArraySeekableStream;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
+import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.FieldRef;
@@ -48,8 +49,12 @@ import org.apache.paimon.utils.LongCounter;
 import org.apache.paimon.utils.RoaringBitmap32;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
@@ -68,6 +73,8 @@ class RowDataFileWriterTest {
 
     private static final Path PATH = new Path("file:/tmp/data-file");
     private static final RowType ROW_TYPE = RowType.builder().field("id", DataTypes.INT()).build();
+
+    @TempDir java.nio.file.Path tempDir;
 
     @Test
     void testEligibleBundleIsForwardedWithoutIteration() throws Exception {
@@ -300,43 +307,59 @@ class RowDataFileWriterTest {
         assertThat(writer.result().embeddedIndex()).isNotNull();
     }
 
-    @Test
-    void testVectorizedBundlesPreserveBitmapPositions() throws Exception {
-        TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testVectorizedBundlesPreserveBitmapPositions(boolean externalIndex) throws Exception {
+        Options options = new Options();
+        options.set("file-index.bitmap.columns", "id");
+        options.set("file-index.in-manifest-threshold", externalIndex ? "0B" : "1MB");
+        FileIndexOptions indexOptions = new FileIndexOptions(new CoreOptions(options));
         LongCounter sequenceCounter = new LongCounter(5);
-        RowDataFileWriter writer =
-                createWriter(
-                        fileIO(),
-                        ROW_TYPE,
-                        formatWriter,
-                        SimpleStatsProducer.disabledProducer(),
-                        sequenceCounter,
-                        bitmapOptions());
+        List<TestingBundleFormatWriter> formatWriters = new ArrayList<>();
+        RollingFileWriterImpl<InternalRow, DataFileMeta> writer =
+                new RollingFileWriterImpl<>(
+                        () -> {
+                            TestingBundleFormatWriter formatWriter =
+                                    new TestingBundleFormatWriter();
+                            formatWriters.add(formatWriter);
+                            Path path =
+                                    new Path(
+                                            tempDir.resolve("data-" + formatWriters.size())
+                                                    .toUri());
+                            return createIndexedWriter(
+                                    path, formatWriter, sequenceCounter, indexOptions);
+                        },
+                        Long.MAX_VALUE,
+                        7L);
+        // The first file mixes row writes, selected batches and an empty batch.
         writer.write(GenericRow.of(1));
         VectorizedBundleRecords source = vectorizedRows(1, null, 2, 1);
         writer.writeBundle(new VectorizedBundleRecords(source.batch(), new int[] {2, 0, 1, 2}));
         writer.writeBundle(vectorizedRows());
         writer.writeBundle(vectorizedRows(2, 1));
-
-        assertThat(formatWriter.bundleWrites).isEqualTo(3);
-        assertThat(formatWriter.rowWrites).isEqualTo(1);
-        assertThat(writer.recordCount()).isEqualTo(7);
-        assertThat(sequenceCounter.getValue()).isEqualTo(12);
+        // Index positions must restart at zero after rolling to the second file.
+        writer.writeBundle(vectorizedRows(2, 1));
         writer.close();
-        DataFileMeta result = writer.result();
-        assertThat(result.minSequenceNumber()).isEqualTo(5);
-        assertThat(result.maxSequenceNumber()).isEqualTo(11);
-        try (FileIndexFormat.Reader reader =
-                FileIndexFormat.createReader(
-                        new ByteArraySeekableStream(result.embeddedIndex()), ROW_TYPE)) {
+
+        assertThat(formatWriters).extracting(w -> w.bundleWrites).containsExactly(3, 1);
+        assertThat(formatWriters).extracting(w -> w.rowWrites).containsExactly(1, 0);
+        assertThat(writer.recordCount()).isEqualTo(9);
+        assertThat(sequenceCounter.getValue()).isEqualTo(14);
+        List<DataFileMeta> files = writer.result();
+        assertThat(files).extracting(DataFileMeta::rowCount).containsExactly(7L, 2L);
+        assertThat(files).extracting(DataFileMeta::minSequenceNumber).containsExactly(5L, 12L);
+        assertThat(files).extracting(DataFileMeta::maxSequenceNumber).containsExactly(11L, 13L);
+        try (FileIndexFormat.Reader reader = readFileIndex(files.get(0), externalIndex)) {
             FileIndexReader index = reader.readColumnIndex("id").iterator().next();
-            FieldRef field = new FieldRef(0, "id", DataTypes.INT());
-            assertThat(((BitmapIndexResult) index.visitEqual(field, 1)).get())
-                    .isEqualTo(RoaringBitmap32.bitmapOf(0, 2, 6));
-            assertThat(((BitmapIndexResult) index.visitEqual(field, 2)).get())
-                    .isEqualTo(RoaringBitmap32.bitmapOf(1, 4, 5));
-            assertThat(((BitmapIndexResult) index.visitIsNull(field)).get())
-                    .isEqualTo(RoaringBitmap32.bitmapOf(3));
+            assertBitmapPositions(index, 1, 0, 2, 6);
+            assertBitmapPositions(index, 2, 1, 4, 5);
+            assertBitmapPositions(index, null, 3);
+        }
+        try (FileIndexFormat.Reader reader = readFileIndex(files.get(1), externalIndex)) {
+            FileIndexReader index = reader.readColumnIndex("id").iterator().next();
+            assertBitmapPositions(index, 1, 1);
+            assertBitmapPositions(index, 2, 0);
+            assertBitmapPositions(index, null);
         }
     }
 
@@ -477,6 +500,57 @@ class RowDataFileWriterTest {
         FileIO fileIO = mock(FileIO.class);
         when(fileIO.getFileSize(PATH)).thenReturn(123L);
         return fileIO;
+    }
+
+    private static RowDataFileWriter createIndexedWriter(
+            Path path,
+            FormatWriter formatWriter,
+            LongCounter sequenceCounter,
+            FileIndexOptions indexOptions) {
+        return new RowDataFileWriter(
+                LocalFileIO.create(),
+                new FileWriterContext(
+                        (out, compression) -> formatWriter,
+                        SimpleStatsProducer.disabledProducer(),
+                        "none"),
+                path,
+                ROW_TYPE,
+                1L,
+                () -> sequenceCounter,
+                indexOptions,
+                FileSource.APPEND,
+                false,
+                false,
+                false,
+                null,
+                null,
+                null);
+    }
+
+    private FileIndexFormat.Reader readFileIndex(DataFileMeta file, boolean externalIndex)
+            throws IOException {
+        if (externalIndex) {
+            assertThat(file.embeddedIndex()).isNull();
+            assertThat(file.extraFiles()).hasSize(1);
+            return FileIndexFormat.createReader(
+                    LocalFileIO.create()
+                            .newInputStream(
+                                    new Path(tempDir.resolve(file.extraFiles().get(0)).toUri())),
+                    ROW_TYPE);
+        }
+        assertThat(file.extraFiles()).isEmpty();
+        assertThat(file.embeddedIndex()).isNotNull();
+        return FileIndexFormat.createReader(
+                new ByteArraySeekableStream(file.embeddedIndex()), ROW_TYPE);
+    }
+
+    private static void assertBitmapPositions(
+            FileIndexReader index, Integer value, int... positions) {
+        FieldRef field = new FieldRef(0, "id", DataTypes.INT());
+        BitmapIndexResult result =
+                (BitmapIndexResult)
+                        (value == null ? index.visitIsNull(field) : index.visitEqual(field, value));
+        assertThat(result.get()).isEqualTo(RoaringBitmap32.bitmapOf(positions));
     }
 
     private static FileIndexOptions bitmapOptions() {
