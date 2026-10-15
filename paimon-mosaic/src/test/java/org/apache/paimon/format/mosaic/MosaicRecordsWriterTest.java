@@ -28,6 +28,7 @@ import org.apache.paimon.format.FileFormatFactory;
 import org.apache.paimon.mosaic.MosaicWriter;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 
@@ -106,7 +107,7 @@ class MosaicRecordsWriterTest {
     }
 
     @Test
-    void testDifferentAllocatorRootFallsBackToRows() throws Exception {
+    void testDifferentAllocatorRootUsesDirectWrite() throws Exception {
         RowType rowType = RowType.builder().field("value", DataTypes.INT()).build();
         RootAllocator writerAllocator = new RootAllocator();
         MosaicWriter nativeWriter = mock(MosaicWriter.class);
@@ -120,7 +121,8 @@ class MosaicRecordsWriterTest {
 
             writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
 
-            verify(nativeWriter, never()).write(same(root));
+            verify(nativeWriter).write(same(root));
+            assertThat(((IntVector) root.getVector("value")).get(0)).isEqualTo(1);
         }
         writer.close();
 
@@ -165,6 +167,176 @@ class MosaicRecordsWriterTest {
         }
         writer.close();
 
+        verify(nativeWriter).write(any(VectorSchemaRoot.class));
+    }
+
+    @Test
+    void testMixedTopLevelRootMosaicBundleFallsBackToRows() throws Exception {
+        RowType rowType =
+                RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        RootAllocator writerAllocator = new RootAllocator();
+        MosaicRecordsWriter writer = createWriter(rowType, writerAllocator, nativeWriter);
+
+        try (RootAllocator firstAllocator = new RootAllocator();
+                RootAllocator secondAllocator = new RootAllocator()) {
+            IntVector a =
+                    (IntVector)
+                            ArrowUtils.createVector(
+                                    rowType.getFields().get(0), firstAllocator, true);
+            IntVector b =
+                    (IntVector)
+                            ArrowUtils.createVector(
+                                    rowType.getFields().get(1), secondAllocator, true);
+            try (VectorSchemaRoot root = VectorSchemaRoot.of(a, b)) {
+                setInt(a, 10);
+                setInt(b, 20);
+                root.setRowCount(1);
+
+                writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
+
+                verify(nativeWriter, never()).write(same(root));
+            }
+        } finally {
+            writer.close();
+        }
+
+        verify(nativeWriter).write(any(VectorSchemaRoot.class));
+    }
+
+    @Test
+    void testEachArrowBatchValidatesSchemaWithReusedRowType() throws Exception {
+        RowType writerType =
+                new RowType(Collections.singletonList(new DataField(7, "a", DataTypes.INT())));
+        RowType conflictingSchemaType =
+                new RowType(Collections.singletonList(new DataField(8, "a", DataTypes.INT())));
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        RootAllocator writerAllocator = new RootAllocator();
+        MosaicRecordsWriter writer = createWriter(writerType, writerAllocator, nativeWriter);
+
+        try (BufferAllocator sourceAllocator =
+                        writerAllocator.newChildAllocator(
+                                "same-root-schema-validation", 0, Long.MAX_VALUE);
+                VectorSchemaRoot firstRoot =
+                        ArrowUtils.createVectorSchemaRoot(writerType, sourceAllocator);
+                VectorSchemaRoot secondRoot =
+                        ArrowUtils.createVectorSchemaRoot(conflictingSchemaType, sourceAllocator)) {
+            setInt((IntVector) firstRoot.getVector("a"), 10);
+            firstRoot.setRowCount(1);
+            setInt((IntVector) secondRoot.getVector("a"), 20);
+            secondRoot.setRowCount(1);
+
+            writer.writeBundle(new ArrowBundleRecords(firstRoot, writerType, true));
+            writer.writeBundle(new ArrowBundleRecords(secondRoot, writerType, true));
+
+            verify(nativeWriter).write(same(firstRoot));
+            verify(nativeWriter, never()).write(same(secondRoot));
+
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void testEmptyArrowBundleDoesNotReachNativeWriter() throws Exception {
+        RowType rowType = RowType.builder().field("a", DataTypes.INT()).build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        try (RootAllocator source = new RootAllocator();
+                VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(rowType, source);
+                MosaicRecordsWriter writer =
+                        createWriter(rowType, new RootAllocator(), nativeWriter)) {
+            writer.writeBundle(new ArrowBundleRecords(root, rowType, true));
+        }
+        verify(nativeWriter, never()).write(any(VectorSchemaRoot.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+            strings = {
+                "rename",
+                "reorder",
+                "field-id",
+                "nullable",
+                "not-null",
+                "row-nullability",
+                "mapping"
+            })
+    void testIncompatibleArrowBundleFallsBack(String change) throws Exception {
+        RowType writerType =
+                RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
+        RowType bundleType = writerType;
+        RowType rootType = writerType;
+        switch (change) {
+            case "rename":
+                bundleType =
+                        RowType.builder()
+                                .field("old_a", DataTypes.INT())
+                                .field("b", DataTypes.INT())
+                                .build();
+                rootType = bundleType;
+                break;
+            case "reorder":
+                rootType = writerType.project(new int[] {1, 0});
+                break;
+            case "field-id":
+                rootType =
+                        new RowType(
+                                Arrays.asList(
+                                        new DataField(7, "a", DataTypes.INT()),
+                                        writerType.getFields().get(1)));
+                bundleType = rootType;
+                break;
+            case "nullable":
+                writerType =
+                        RowType.builder()
+                                .field("a", DataTypes.INT().notNull())
+                                .field("b", DataTypes.INT())
+                                .build();
+                break;
+            case "not-null":
+                bundleType =
+                        RowType.builder()
+                                .field("a", DataTypes.INT().notNull())
+                                .field("b", DataTypes.INT())
+                                .build();
+                rootType = bundleType;
+                break;
+            case "row-nullability":
+                bundleType = writerType.notNull();
+                break;
+            case "mapping":
+                rootType =
+                        RowType.builder()
+                                .field("other", DataTypes.INT())
+                                .field("b", DataTypes.INT())
+                                .build();
+                break;
+            default:
+                throw new IllegalArgumentException(change);
+        }
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        doAnswer(
+                        call -> {
+                            VectorSchemaRoot written = call.getArgument(0);
+                            assertThat(written.getVector("a").getObject(0))
+                                    .isEqualTo(change.equals("mapping") ? null : 10);
+                            assertThat(written.getVector("b").getObject(0)).isEqualTo(20);
+                            return null;
+                        })
+                .when(nativeWriter)
+                .write(any(VectorSchemaRoot.class));
+        try (RootAllocator source = new RootAllocator();
+                VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(rootType, source);
+                MosaicRecordsWriter writer =
+                        createWriter(writerType, new RootAllocator(), nativeWriter)) {
+            for (int i = 0; i < root.getFieldVectors().size(); i++) {
+                IntVector vector = (IntVector) root.getVector(i);
+                setInt(vector, vector.getName().equals("b") ? 20 : 10);
+            }
+            root.setRowCount(1);
+            writer.writeBundle(new ArrowBundleRecords(root, bundleType, true));
+            verify(nativeWriter, never()).write(same(root));
+        }
         verify(nativeWriter).write(any(VectorSchemaRoot.class));
     }
 
@@ -416,8 +588,7 @@ class MosaicRecordsWriterTest {
         doThrow(failure).when(nativeWriter).write(any(VectorSchemaRoot.class));
         CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
         try (MosaicRecordsWriter writer = createWriter(type, allocator, nativeWriter)) {
-            try (BufferAllocator sourceAllocator =
-                            allocator.newChildAllocator("mosaic-failure-test", 0, Long.MAX_VALUE);
+            try (BufferAllocator sourceAllocator = new RootAllocator();
                     VectorSchemaRoot root =
                             ArrowUtils.createVectorSchemaRoot(type, sourceAllocator)) {
                 setInt((IntVector) root.getVector("a"), 1);

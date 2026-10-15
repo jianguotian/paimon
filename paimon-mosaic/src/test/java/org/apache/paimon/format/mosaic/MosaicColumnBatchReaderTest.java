@@ -19,6 +19,7 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowUtils;
+import org.apache.paimon.arrow.reader.ArrowVectorizedRecordIterator;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.SeekableInputStream;
@@ -28,6 +29,7 @@ import org.apache.paimon.mosaic.MosaicReader;
 import org.apache.paimon.reader.FileRecordIterator;
 import org.apache.paimon.reader.VectorizedRecordIterator;
 import org.apache.paimon.table.SpecialFields;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 
@@ -37,14 +39,19 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -58,6 +65,218 @@ import static org.mockito.Mockito.when;
 
 /** Test for {@link MosaicRecordsReader}. */
 class MosaicColumnBatchReaderTest {
+
+    @Test
+    void testExactArrowSchemaExposesOriginalArrowBundle() throws IOException {
+        CloseCountingSeekableInputStream inputStream = new CloseCountingSeekableInputStream();
+        MosaicInputFileAdapter inputFileAdapter = createInputFileAdapter(inputStream);
+        CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+        MosaicReader reader = mock(MosaicReader.class);
+        VectorSchemaRoot root = ArrowUtils.createVectorSchemaRoot(rowType(), allocator);
+        IntVector vector = (IntVector) root.getVector(0);
+        vector.allocateNew(3);
+        vector.setSafe(0, 10);
+        vector.setNull(1);
+        vector.setSafe(2, 30);
+        vector.setValueCount(3);
+        root.setRowCount(3);
+        when(reader.getSchema()).thenReturn(root.getSchema());
+        when(reader.numRowGroups()).thenReturn(1);
+        when(reader.rowGroupNumRows(0)).thenReturn(3);
+        when(reader.readRowGroup(0, allocator)).thenReturn(root);
+
+        MosaicRecordsReader recordsReader =
+                createRecordsReader(inputFileAdapter, allocator, reader);
+        FileRecordIterator<InternalRow> records = recordsReader.readBatch();
+
+        assertThat(records).isInstanceOf(ArrowVectorizedRecordIterator.class);
+        ArrowVectorizedRecordIterator arrowRecords = (ArrowVectorizedRecordIterator) records;
+        assertThat(arrowRecords.arrowBundle().getVectorSchemaRoot()).isSameAs(root);
+        assertThat(arrowRecords.batch().getNumRows()).isEqualTo(3);
+        assertThat(records.next().getInt(0)).isEqualTo(10);
+        assertThatThrownBy(arrowRecords::arrowBundle)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("after next()");
+        assertThat(records.returnedPosition()).isZero();
+        records.releaseBatch();
+        records.releaseBatch();
+        assertThat(allocator.getAllocatedMemory()).isZero();
+
+        verify(reader, never()).project(any());
+        recordsReader.close();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"subset", "reorder", "missing", "nullable", "not-null"})
+    void testNonExactProjectionFallsBack(String change) throws IOException {
+        RowType fileType = arrowType();
+        RowType projection = fileType;
+        switch (change) {
+            case "subset":
+                projection = fileType.project(new int[] {0});
+                break;
+            case "reorder":
+                projection = fileType.project(new int[] {1, 0});
+                break;
+            case "missing":
+                projection =
+                        new RowType(
+                                Arrays.asList(
+                                        fileType.getFields().get(0),
+                                        new DataField(2, "missing", DataTypes.INT())));
+                break;
+            case "nullable":
+                fileType =
+                        RowType.builder()
+                                .field("a", DataTypes.INT().notNull())
+                                .field("b", DataTypes.INT())
+                                .build();
+                break;
+            case "not-null":
+                projection =
+                        RowType.builder()
+                                .field("a", DataTypes.INT().notNull())
+                                .field("b", DataTypes.INT())
+                                .build();
+                break;
+            default:
+                throw new IllegalArgumentException(change);
+        }
+        try (ArrowReaderFixture fixture = new ArrowReaderFixture(fileType, projection)) {
+            FileRecordIterator<InternalRow> batch = fixture.reader.readBatch();
+            assertThat(batch)
+                    .isInstanceOf(VectorizedRecordIterator.class)
+                    .isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+            InternalRow row = batch.next();
+            for (int i = 0; i < projection.getFieldCount(); i++) {
+                String name = projection.getFields().get(i).name();
+                if (name.equals("missing")) {
+                    assertThat(row.isNullAt(i)).isTrue();
+                } else {
+                    assertThat(row.getInt(i)).isEqualTo(name.equals("a") ? 10 : 20);
+                }
+            }
+            batch.releaseBatch();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "prefix", "reorder", "missing", "rename"})
+    void testDataFileMappingPreservesOnlyWholeBatch(String change) throws IOException {
+        RowType fileType = arrowType();
+        int[] mapping = new int[] {0, 1};
+        RowType tableType = fileType;
+        if (change.equals("prefix")) {
+            mapping = new int[] {0};
+            tableType = fileType.project(mapping);
+        } else if (change.equals("reorder")) {
+            mapping = new int[] {1, 0};
+            tableType = fileType.project(mapping);
+        } else if (change.equals("missing")) {
+            mapping = new int[] {0, -1, 1};
+            tableType =
+                    new RowType(
+                            Arrays.asList(
+                                    fileType.getFields().get(0),
+                                    new DataField(2, "missing", DataTypes.INT()),
+                                    fileType.getFields().get(1)));
+        } else if (change.equals("rename")) {
+            tableType =
+                    RowType.builder()
+                            .field("renamed", DataTypes.INT())
+                            .field("b", DataTypes.INT())
+                            .build();
+        }
+        try (ArrowReaderFixture fixture = new ArrowReaderFixture(fileType, fileType)) {
+            DataFileRecordReader reader =
+                    new DataFileRecordReader(
+                            tableType,
+                            fixture.reader,
+                            false,
+                            false,
+                            mapping,
+                            null,
+                            null,
+                            false,
+                            null,
+                            0,
+                            Collections.emptyMap(),
+                            null,
+                            new Path("file:/tmp/mosaic-reader-test"));
+            FileRecordIterator<InternalRow> batch = reader.readBatch();
+            if (change.equals("identity") || change.equals("rename")) {
+                assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+                // A renamed table still exposes the original file schema; the writer must reject
+                // it.
+                assertThat(((ArrowVectorizedRecordIterator) batch).arrowBundle().getRowType())
+                        .isEqualTo(fileType);
+            } else {
+                assertThat(batch).isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+            }
+            InternalRow row = batch.next();
+            assertThat(row.getFieldCount()).isEqualTo(mapping.length);
+            for (int i = 0; i < mapping.length; i++) {
+                if (mapping[i] < 0) {
+                    assertThat(row.isNullAt(i)).isTrue();
+                } else {
+                    assertThat(row.getInt(i)).isEqualTo(mapping[i] == 0 ? 10 : 20);
+                }
+            }
+            batch.releaseBatch();
+        }
+    }
+
+    private static RowType arrowType() {
+        return RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
+    }
+
+    private static class ArrowReaderFixture implements AutoCloseable {
+        private final CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();
+        private final MosaicRecordsReader reader;
+
+        private ArrowReaderFixture(RowType fileType, RowType projection) throws IOException {
+            Schema fileSchema;
+            try (VectorSchemaRoot schemaRoot =
+                    ArrowUtils.createVectorSchemaRoot(fileType, allocator)) {
+                fileSchema = schemaRoot.getSchema();
+            }
+            List<DataField> fields =
+                    projection.getFieldNames().stream()
+                            .flatMap(
+                                    name ->
+                                            fileType.getFields().stream()
+                                                    .filter(f -> f.name().equals(name)))
+                            .collect(Collectors.toList());
+            VectorSchemaRoot root =
+                    ArrowUtils.createVectorSchemaRoot(new RowType(fields), allocator);
+            for (int i = 0; i < fields.size(); i++) {
+                IntVector vector = (IntVector) root.getVector(i);
+                vector.setSafe(0, fields.get(i).name().equals("a") ? 10 : 20);
+            }
+            root.setRowCount(1);
+            MosaicReader nativeReader = mock(MosaicReader.class);
+            when(nativeReader.getSchema()).thenReturn(fileSchema);
+            when(nativeReader.numRowGroups()).thenReturn(1);
+            when(nativeReader.rowGroupNumRows(0)).thenReturn(1);
+            when(nativeReader.readRowGroup(0, allocator)).thenReturn(root);
+            reader =
+                    new MosaicRecordsReader(
+                            createInputFileAdapter(new CloseCountingSeekableInputStream()),
+                            0,
+                            fileType,
+                            projection,
+                            null,
+                            new Path("file:/tmp/mosaic-reader-test"),
+                            allocator,
+                            (input, size, owner) -> nativeReader);
+        }
+
+        @Override
+        public void close() throws IOException {
+            reader.close();
+            assertThat(allocator.getAllocatedMemory()).isZero();
+        }
+    }
 
     @Test
     void testConstructorRuntimeExceptionClosesCreatedResources() throws IOException {
