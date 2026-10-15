@@ -244,12 +244,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
                 }
             }
             createdAllProjectedColumnsMissing = existingColumns.isEmpty();
-            this.arrowBundleCompatible =
-                    existingColumns.size() == projectedFieldCount
-                            && MosaicArrowProjection.matchesProjection(
-                                    projectedRowType, fileSchema);
-            if (!existingColumns.isEmpty()
-                    && !hasExactProjection(projectedNames, fileSchema.getFields())) {
+            this.arrowBundleCompatible = MosaicArrowSchema.matches(projectedRowType, fileSchema);
+            if (!existingColumns.isEmpty() && !arrowBundleCompatible) {
                 createdReader.project(existingColumns.toArray(new String[0]));
             }
 
@@ -585,18 +581,6 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             }
             throw rethrowUnchecked(t);
         }
-    }
-
-    private static boolean hasExactProjection(List<String> projectedNames, List<Field> fileFields) {
-        if (projectedNames.size() != fileFields.size()) {
-            return false;
-        }
-        for (int i = 0; i < projectedNames.size(); i++) {
-            if (!projectedNames.get(i).equals(fileFields.get(i).getName())) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private void releaseActiveBatches() {
