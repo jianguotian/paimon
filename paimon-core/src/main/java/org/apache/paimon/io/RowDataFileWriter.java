@@ -134,7 +134,7 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
             return false;
         }
         return auxiliaryFileWriters.isEmpty()
-                || (bundle instanceof VectorizedBundleRecords
+                || (bundle.isRepeatable()
                         && auxiliaryFileWriters.stream()
                                 .allMatch(
                                         writer -> writer instanceof DataFileIndexAuxiliaryWriter));
@@ -147,7 +147,7 @@ public class RowDataFileWriter extends StatsCollectingSingleFileWriter<InternalR
         if (closed) {
             throw new RuntimeException("Writer has already closed!");
         }
-        // Vectorized bundles expose repeatable row views without consuming the batch.
+        // Repeatable bundles allow index reads without consuming the format writer input.
         // Read index fields before the format writer may transfer the borrowed buffers.
         try {
             for (InternalRow row : bundle) {

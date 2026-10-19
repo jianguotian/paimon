@@ -21,6 +21,7 @@ package org.apache.paimon.format.mosaic;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
+import org.apache.paimon.arrow.reader.ArrowVectorizedRecordIterator;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
@@ -67,6 +68,9 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -91,8 +95,9 @@ class MosaicReaderWriterTest {
         assumeTrue(isNativeAvailable(), "Mosaic native library not available");
     }
 
-    @Test
-    void testColumnBatchRoundTripThroughPublicWriter() throws IOException {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testBatchRoundTripThroughPublicWriter(boolean arrow) throws IOException {
         RowType rowType =
                 RowType.builder()
                         .field("id", DataTypes.INT())
@@ -123,10 +128,22 @@ class MosaicReaderWriterTest {
             while ((batch = reader.readBatch()) != null) {
                 try {
                     assertThat(batch).isInstanceOf(VectorizedRecordIterator.class);
-                    ((BundleFormatWriter) writer)
-                            .writeBundle(
-                                    new VectorizedBundleRecords(
-                                            ((VectorizedRecordIterator) batch).batch(), null));
+                    if (arrow) {
+                        assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+                        ArrowBundleRecords original =
+                                ((ArrowVectorizedRecordIterator) batch).arrowBundle();
+                        CountingArrowBundleRecords records =
+                                new CountingArrowBundleRecords(
+                                        original.getVectorSchemaRoot(), original.getRowType());
+                        ((BundleFormatWriter) writer).writeBundle(records);
+                        assertThat(records.iteratorCalls()).isZero();
+                        assertThat(original.rowCount()).isPositive();
+                    } else {
+                        ((BundleFormatWriter) writer)
+                                .writeBundle(
+                                        new VectorizedBundleRecords(
+                                                ((VectorizedRecordIterator) batch).batch(), null));
+                    }
                 } finally {
                     batch.releaseBatch();
                 }
@@ -159,14 +176,23 @@ class MosaicReaderWriterTest {
         assertThat(result.get(1).getString(1).toString()).isEqualTo("world");
     }
 
-    @Test
-    void testColumnBatchRewritePreservesVinBitmap() throws IOException {
-        RowType rowType = RowType.builder().field("vin", DataTypes.STRING()).build();
+    @ParameterizedTest
+    @CsvSource({"false, false", "true, false", "false, true", "true, true"})
+    void testColumnBatchRewritePreservesVinBitmap(boolean arrow, boolean missing)
+            throws IOException {
+        RowType fileType = RowType.builder().field("vin", DataTypes.STRING().notNull()).build();
+        RowType rowType =
+                missing
+                        ? RowType.builder()
+                                .field("vin", DataTypes.STRING())
+                                .field("missing", DataTypes.DOUBLE())
+                                .build()
+                        : fileType;
         Path sourcePath = newPath();
         Path targetPath = newPath();
         BinaryString a = BinaryString.fromString("A");
         BinaryString b = BinaryString.fromString("B");
-        writeRows(rowType, sourcePath, GenericRow.of(a), GenericRow.of(b), GenericRow.of(a));
+        writeRows(fileType, sourcePath, GenericRow.of(a), GenericRow.of(b), GenericRow.of(a));
 
         LocalFileIO fileIO = new LocalFileIO();
         MosaicFileFormat format = createFormat("vin");
@@ -194,7 +220,8 @@ class MosaicReaderWriterTest {
                                 RollingFileWriter.createStatsProducer(
                                         format,
                                         rowType,
-                                        SimpleColStatsCollector.createFullStatsFactories(1)),
+                                        SimpleColStatsCollector.createFullStatsFactories(
+                                                rowType.getFieldCount())),
                                 "zstd"),
                         targetPath,
                         rowType,
@@ -222,8 +249,10 @@ class MosaicReaderWriterTest {
                 try {
                     assertThat(records).isInstanceOf(VectorizedRecordIterator.class);
                     writer.writeBundle(
-                            new VectorizedBundleRecords(
-                                    ((VectorizedRecordIterator) records).batch(), null));
+                            arrow
+                                    ? ((ArrowVectorizedRecordIterator) records).arrowBundle()
+                                    : new VectorizedBundleRecords(
+                                            ((VectorizedRecordIterator) records).batch(), null));
                 } finally {
                     records.releaseBatch();
                 }
@@ -234,6 +263,10 @@ class MosaicReaderWriterTest {
         assertThat(readAll(rowType, rowType, targetPath, null))
                 .extracting(row -> row.getString(0))
                 .containsExactly(a, b, a);
+        if (missing) {
+            assertThat(readAll(rowType, rowType, targetPath, null))
+                    .allSatisfy(row -> assertThat(row.isNullAt(1)).isTrue());
+        }
         DataFileMeta file = writer.result();
         assertThat(file.rowCount()).isEqualTo(3);
         assertThat(file.valueStats().minValues().getString(0)).isEqualTo(a);
@@ -251,7 +284,7 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testPublicWriterFactoryFallsBackForCrossRootArrowBundle() throws IOException {
+    void testPublicWriterFactoryDirectlyWritesCrossRootArrowBundle() throws IOException {
         RowType rowType = RowType.builder().field("value", DataTypes.INT()).build();
         Path path = newPath();
         MosaicFileFormat format = createFormat();
@@ -272,14 +305,19 @@ class MosaicReaderWriterTest {
             root.setRowCount(2);
 
             CountingArrowBundleRecords bundle = new CountingArrowBundleRecords(root, rowType);
+            writer.addElement(GenericRow.of(5));
             writer.writeBundle(bundle);
-            assertThat(bundle.iteratorCalls()).isEqualTo(1);
+            writer.addElement(GenericRow.of(11));
+            assertThat(vector.get(0)).isEqualTo(7);
+            assertThat(bundle.iteratorCalls()).isZero();
         }
 
         List<InternalRow> result = readAll(rowType, rowType, path, null);
-        assertThat(result).hasSize(2);
-        assertThat(result.get(0).getInt(0)).isEqualTo(7);
-        assertThat(result.get(1).getInt(0)).isEqualTo(9);
+        assertThat(result).hasSize(4);
+        assertThat(result.get(0).getInt(0)).isEqualTo(5);
+        assertThat(result.get(1).getInt(0)).isEqualTo(7);
+        assertThat(result.get(2).getInt(0)).isEqualTo(9);
+        assertThat(result.get(3).getInt(0)).isEqualTo(11);
     }
 
     @Test

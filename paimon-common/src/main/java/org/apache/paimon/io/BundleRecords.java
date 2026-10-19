@@ -39,4 +39,14 @@ public interface BundleRecords extends Iterable<InternalRow> {
      * @return the number of records in this batch.
      */
     long rowCount();
+
+    /**
+     * Whether independent iterators expose the same rows in the same order without consuming this
+     * batch. The batch and its backing data must remain unchanged until the write completes.
+     *
+     * <p>This allows file indexes to inspect rows before the format writer consumes the batch.
+     */
+    default boolean isRepeatable() {
+        return false;
+    }
 }

@@ -19,7 +19,6 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.columnar.ColumnVector;
@@ -183,10 +182,16 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
         if (bundleRecords instanceof ArrowBundleRecords) {
             ArrowBundleRecords arrowBundle = (ArrowBundleRecords) bundleRecords;
             VectorSchemaRoot root = arrowBundle.getVectorSchemaRoot();
-            if (arrowFormatWriter.isArrowBundleSchemaCompatible(arrowBundle)
-                    && ArrowUtils.hasSameRootAllocator(root, allocator)) {
-                writeArrowBatch(root);
+            if (root.getRowCount() == 0) {
                 return;
+            }
+            // Mosaic 0.3 exports through the input allocator, which may differ from this writer's.
+            try (MosaicArrowBatchView view =
+                    MosaicArrowBatchView.tryCreate(rowType, arrowBundle, writeBatchMemory)) {
+                if (view != null) {
+                    writeArrowBatch(view.root());
+                    return;
+                }
             }
         }
         for (InternalRow row : bundleRecords) {

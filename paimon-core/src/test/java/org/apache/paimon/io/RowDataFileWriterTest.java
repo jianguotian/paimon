@@ -364,6 +364,35 @@ class RowDataFileWriterTest {
     }
 
     @Test
+    void testRepeatableNonVectorizedBundlePreservesBitmap() throws Exception {
+        TestingBundleFormatWriter formatWriter = new TestingBundleFormatWriter();
+        RowDataFileWriter writer =
+                createWriter(
+                        fileIO(),
+                        ROW_TYPE,
+                        formatWriter,
+                        SimpleStatsProducer.disabledProducer(),
+                        new LongCounter(),
+                        bitmapOptions());
+        BundleRecords bundle =
+                new ListBundleRecords(Arrays.asList(GenericRow.of(1), GenericRow.of(2))) {
+                    @Override
+                    public boolean isRepeatable() {
+                        return true;
+                    }
+                };
+        writer.writeBundle(bundle);
+        assertThat(formatWriter.bundleWrites).isEqualTo(1);
+        assertThat(formatWriter.rowWrites).isZero();
+        writer.close();
+        try (FileIndexFormat.Reader reader = readFileIndex(writer.result(), false)) {
+            FileIndexReader index = reader.readColumnIndex("id").iterator().next();
+            assertBitmapPositions(index, 1, 0);
+            assertBitmapPositions(index, 2, 1);
+        }
+    }
+
+    @Test
     void testIndexedVectorizedBundleAllowsFormatRowFallback() throws Exception {
         TestingFallbackBundleFormatWriter formatWriter = new TestingFallbackBundleFormatWriter();
         RowDataFileWriter writer =
