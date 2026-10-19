@@ -48,6 +48,11 @@ public class VectorizedBundleRecords implements BundleRecords {
     }
 
     @Override
+    public boolean isRepeatable() {
+        return true;
+    }
+
+    @Override
     public long rowCount() {
         return selected != null ? selected.length : batch.getNumRows();
     }

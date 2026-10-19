@@ -108,7 +108,8 @@ class MosaicColumnBatchReaderTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"subset", "reorder", "missing", "nullable", "not-null"})
-    void testNonExactProjectionFallsBack(String change) throws IOException {
+    void testScalarProjectionExposesArrowWithoutAllocatingPadding(String change)
+            throws IOException {
         RowType fileType = arrowType();
         RowType projection = fileType;
         switch (change) {
@@ -144,9 +145,18 @@ class MosaicColumnBatchReaderTest {
         }
         try (ArrowReaderFixture fixture = new ArrowReaderFixture(fileType, projection)) {
             FileRecordIterator<InternalRow> batch = fixture.reader.readBatch();
-            assertThat(batch)
-                    .isInstanceOf(VectorizedRecordIterator.class)
-                    .isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+            assertThat(batch).isInstanceOf(VectorizedRecordIterator.class);
+            if (change.equals("not-null")) {
+                assertThat(batch).isNotInstanceOf(ArrowVectorizedRecordIterator.class);
+            } else {
+                assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
+                assertThat(
+                                ((ArrowVectorizedRecordIterator) batch)
+                                        .arrowBundle()
+                                        .getVectorSchemaRoot()
+                                        .getVector("missing"))
+                        .isNull();
+            }
             InternalRow row = batch.next();
             for (int i = 0; i < projection.getFieldCount(); i++) {
                 String name = projection.getFields().get(i).name();

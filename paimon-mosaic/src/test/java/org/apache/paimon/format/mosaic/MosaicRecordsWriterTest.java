@@ -63,6 +63,36 @@ class MosaicRecordsWriterTest {
             new FileFormatFactory.FormatContext(new Options(), 1024, 1024);
 
     @Test
+    void testAdaptedBatchFailureReleasesPaddingWithoutRetry() throws Exception {
+        RowType sourceType = RowType.builder().field("a", DataTypes.INT()).build();
+        RowType targetType =
+                RowType.builder()
+                        .field("a", DataTypes.INT())
+                        .field("missing", DataTypes.STRING())
+                        .build();
+        MosaicWriter nativeWriter = mock(MosaicWriter.class);
+        RuntimeException failure = new RuntimeException("native write failed");
+        doThrow(failure).when(nativeWriter).write(any(VectorSchemaRoot.class));
+        try (MosaicRecordsWriter writer =
+                        createWriter(targetType, new RootAllocator(), nativeWriter);
+                RootAllocator sourceAllocator = new RootAllocator();
+                VectorSchemaRoot source =
+                        ArrowUtils.createVectorSchemaRoot(sourceType, sourceAllocator)) {
+            setInt((IntVector) source.getVector(0), 42);
+            source.setRowCount(1);
+            long before = sourceAllocator.getAllocatedMemory();
+            assertThatThrownBy(
+                            () ->
+                                    writer.writeBundle(
+                                            new ArrowBundleRecords(source, targetType, true)))
+                    .isSameAs(failure);
+            assertThat(sourceAllocator.getAllocatedMemory()).isEqualTo(before);
+            assertThat(((IntVector) source.getVector(0)).get(0)).isEqualTo(42);
+        }
+        verify(nativeWriter, times(1)).write(any(VectorSchemaRoot.class));
+    }
+
+    @Test
     void testConstructorFailureClosesCreatedResources() {
         RowType rowType = DataTypes.ROW(DataTypes.INT(), DataTypes.STRING());
         CloseCountingRootAllocator allocator = new CloseCountingRootAllocator();

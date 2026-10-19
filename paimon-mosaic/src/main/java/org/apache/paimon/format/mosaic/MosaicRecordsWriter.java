@@ -197,6 +197,15 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
                 writeArrowBatch(root);
                 return;
             }
+            if (rowType.equals(arrowBundle.getRowType())) {
+                try (MosaicArrowBatchView view =
+                        MosaicArrowBatchView.tryCreate(rowType, root, writeBatchMemory)) {
+                    if (view != null) {
+                        writeArrowBatch(view.root());
+                        return;
+                    }
+                }
+            }
         }
         for (InternalRow row : bundleRecords) {
             addElement(row);

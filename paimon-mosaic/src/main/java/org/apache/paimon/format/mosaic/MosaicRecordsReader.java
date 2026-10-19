@@ -337,7 +337,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             if (allProjectedColumnsMissing) {
                 return allNullIterator(batch.startPosition, batch.numRows);
             }
-            if (arrowBundleCompatible) {
+            if (arrowBundleCompatible
+                    || MosaicArrowBatchView.canProject(projectedRowType, vsr.getSchema())) {
                 return new MosaicArrowVectorizedRecordIterator(
                         filePath,
                         batch.startPosition,

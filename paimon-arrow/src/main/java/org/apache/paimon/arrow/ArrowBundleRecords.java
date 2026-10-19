@@ -79,6 +79,11 @@ public class ArrowBundleRecords implements BundleRecords {
     }
 
     @Override
+    public boolean isRepeatable() {
+        return true;
+    }
+
+    @Override
     public long rowCount() {
         return vectorSchemaRoot.getRowCount();
     }

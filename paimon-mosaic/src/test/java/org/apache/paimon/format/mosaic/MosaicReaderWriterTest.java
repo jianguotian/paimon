@@ -69,6 +69,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
@@ -175,14 +176,23 @@ class MosaicReaderWriterTest {
         assertThat(result.get(1).getString(1).toString()).isEqualTo("world");
     }
 
-    @Test
-    void testColumnBatchRewritePreservesVinBitmap() throws IOException {
-        RowType rowType = RowType.builder().field("vin", DataTypes.STRING()).build();
+    @ParameterizedTest
+    @CsvSource({"false, false", "true, false", "false, true", "true, true"})
+    void testColumnBatchRewritePreservesVinBitmap(boolean arrow, boolean missing)
+            throws IOException {
+        RowType fileType = RowType.builder().field("vin", DataTypes.STRING().notNull()).build();
+        RowType rowType =
+                missing
+                        ? RowType.builder()
+                                .field("vin", DataTypes.STRING())
+                                .field("missing", DataTypes.DOUBLE())
+                                .build()
+                        : fileType;
         Path sourcePath = newPath();
         Path targetPath = newPath();
         BinaryString a = BinaryString.fromString("A");
         BinaryString b = BinaryString.fromString("B");
-        writeRows(rowType, sourcePath, GenericRow.of(a), GenericRow.of(b), GenericRow.of(a));
+        writeRows(fileType, sourcePath, GenericRow.of(a), GenericRow.of(b), GenericRow.of(a));
 
         LocalFileIO fileIO = new LocalFileIO();
         MosaicFileFormat format = createFormat("vin");
@@ -210,7 +220,8 @@ class MosaicReaderWriterTest {
                                 RollingFileWriter.createStatsProducer(
                                         format,
                                         rowType,
-                                        SimpleColStatsCollector.createFullStatsFactories(1)),
+                                        SimpleColStatsCollector.createFullStatsFactories(
+                                                rowType.getFieldCount())),
                                 "zstd"),
                         targetPath,
                         rowType,
@@ -238,8 +249,10 @@ class MosaicReaderWriterTest {
                 try {
                     assertThat(records).isInstanceOf(VectorizedRecordIterator.class);
                     writer.writeBundle(
-                            new VectorizedBundleRecords(
-                                    ((VectorizedRecordIterator) records).batch(), null));
+                            arrow
+                                    ? ((ArrowVectorizedRecordIterator) records).arrowBundle()
+                                    : new VectorizedBundleRecords(
+                                            ((VectorizedRecordIterator) records).batch(), null));
                 } finally {
                     records.releaseBatch();
                 }
@@ -250,6 +263,10 @@ class MosaicReaderWriterTest {
         assertThat(readAll(rowType, rowType, targetPath, null))
                 .extracting(row -> row.getString(0))
                 .containsExactly(a, b, a);
+        if (missing) {
+            assertThat(readAll(rowType, rowType, targetPath, null))
+                    .allSatisfy(row -> assertThat(row.isNullAt(1)).isTrue());
+        }
         DataFileMeta file = writer.result();
         assertThat(file.rowCount()).isEqualTo(3);
         assertThat(file.valueStats().minValues().getString(0)).isEqualTo(a);
