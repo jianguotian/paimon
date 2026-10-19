@@ -321,37 +321,6 @@ class MosaicReaderWriterTest {
     }
 
     @Test
-    void testExactSchemaReadExposesArrowBundle() throws IOException {
-        RowType rowType =
-                RowType.builder()
-                        .field("id", DataTypes.INT())
-                        .field("name", DataTypes.STRING())
-                        .build();
-        Path path = newPath();
-        writeRows(
-                rowType,
-                path,
-                GenericRow.of(1, BinaryString.fromString("hello")),
-                GenericRow.of(2, BinaryString.fromString("world")));
-
-        MosaicFileFormat format = createFormat();
-        FormatReaderFactory readerFactory = format.createReaderFactory(rowType, rowType, null);
-        LocalFileIO fileIO = new LocalFileIO();
-        try (RecordReader<InternalRow> reader =
-                readerFactory.createReader(
-                        new FormatReaderContext(
-                                fileIO, path, fileIO.getFileSize(path), null, null))) {
-            RecordReader.RecordIterator<InternalRow> batch = reader.readBatch();
-            assertThat(batch).isInstanceOf(ArrowVectorizedRecordIterator.class);
-            ArrowVectorizedRecordIterator arrowBatch = (ArrowVectorizedRecordIterator) batch;
-            assertThat(arrowBatch.arrowBundle().rowCount()).isEqualTo(2);
-            assertThat(arrowBatch.arrowBundle().getVectorSchemaRoot().getSchema().getFields())
-                    .hasSize(2);
-            batch.releaseBatch();
-        }
-    }
-
-    @Test
     void testNullValues() throws IOException {
         RowType rowType = DataTypes.ROW(DataTypes.INT(), DataTypes.STRING());
         Path path = newPath();

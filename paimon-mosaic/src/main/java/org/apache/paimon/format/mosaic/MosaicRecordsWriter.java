@@ -19,7 +19,6 @@
 package org.apache.paimon.format.mosaic;
 
 import org.apache.paimon.arrow.ArrowBundleRecords;
-import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.arrow.vector.ArrowFormatWriter;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.columnar.ColumnVector;
@@ -186,24 +185,12 @@ public class MosaicRecordsWriter implements BundleFormatWriter {
             if (root.getRowCount() == 0) {
                 return;
             }
-            // Mosaic 0.3 exports through the input allocator. It may differ from this writer's
-            // allocator, but all vectors in the input batch must share one root allocator.
-            if (arrowBundle.hasIdentityMapping()
-                    && rowType.equals(arrowBundle.getRowType())
-                    && MosaicArrowSchema.matches(
-                            arrowFormatWriter.getVectorSchemaRoot().getSchema(), root.getSchema())
-                    && !root.getFieldVectors().isEmpty()
-                    && ArrowUtils.hasSameRootAllocator(root, root.getVector(0).getAllocator())) {
-                writeArrowBatch(root);
-                return;
-            }
-            if (rowType.equals(arrowBundle.getRowType())) {
-                try (MosaicArrowBatchView view =
-                        MosaicArrowBatchView.tryCreate(rowType, root, writeBatchMemory)) {
-                    if (view != null) {
-                        writeArrowBatch(view.root());
-                        return;
-                    }
+            // Mosaic 0.3 exports through the input allocator, which may differ from this writer's.
+            try (MosaicArrowBatchView view =
+                    MosaicArrowBatchView.tryCreate(rowType, arrowBundle, writeBatchMemory)) {
+                if (view != null) {
+                    writeArrowBatch(view.root());
+                    return;
                 }
             }
         }

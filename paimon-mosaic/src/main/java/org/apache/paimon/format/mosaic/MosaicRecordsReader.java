@@ -244,7 +244,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
                 }
             }
             createdAllProjectedColumnsMissing = existingColumns.isEmpty();
-            this.arrowBundleCompatible = MosaicArrowSchema.matches(projectedRowType, fileSchema);
+            this.arrowBundleCompatible = MosaicArrowBatchView.matches(projectedRowType, fileSchema);
             if (!existingColumns.isEmpty() && !arrowBundleCompatible) {
                 createdReader.project(existingColumns.toArray(new String[0]));
             }

@@ -289,9 +289,10 @@ class MosaicRecordsWriterTest {
                 "nullable",
                 "not-null",
                 "row-nullability",
-                "mapping"
+                "mapping",
+                "case-insensitive"
             })
-    void testIncompatibleArrowBundleFallsBack(String change) throws Exception {
+    void testArrowBundlePreservesLogicalSchema(String change) throws Exception {
         RowType writerType =
                 RowType.builder().field("a", DataTypes.INT()).field("b", DataTypes.INT()).build();
         RowType bundleType = writerType;
@@ -334,6 +335,13 @@ class MosaicRecordsWriterTest {
             case "row-nullability":
                 bundleType = writerType.notNull();
                 break;
+            case "case-insensitive":
+                rootType =
+                        RowType.builder()
+                                .field("A", DataTypes.INT())
+                                .field("b", DataTypes.INT())
+                                .build();
+                break;
             case "mapping":
                 rootType =
                         RowType.builder()
@@ -364,7 +372,8 @@ class MosaicRecordsWriterTest {
                 setInt(vector, vector.getName().equals("b") ? 20 : 10);
             }
             root.setRowCount(1);
-            writer.writeBundle(new ArrowBundleRecords(root, bundleType, true));
+            writer.writeBundle(
+                    new ArrowBundleRecords(root, bundleType, !change.equals("case-insensitive")));
             verify(nativeWriter, never()).write(same(root));
         }
         verify(nativeWriter).write(any(VectorSchemaRoot.class));

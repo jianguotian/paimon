@@ -18,6 +18,7 @@
 
 package org.apache.paimon.format.mosaic;
 
+import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
@@ -26,13 +27,24 @@ import org.apache.paimon.types.RowType;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Stream;
 
+import static java.util.Arrays.asList;
+import static java.util.Collections.singletonList;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 /** Tests bounded schema adaptation without copying existing vectors. */
 class MosaicArrowBatchViewTest {
@@ -50,7 +62,9 @@ class MosaicArrowBatchViewTest {
         try (RootAllocator allocator = new RootAllocator();
                 VectorSchemaRoot source = source(allocator)) {
             long before = allocator.getAllocatedMemory();
-            MosaicArrowBatchView view = MosaicArrowBatchView.tryCreate(TARGET, source, 1024);
+            MosaicArrowBatchView view =
+                    MosaicArrowBatchView.tryCreate(
+                            TARGET, new ArrowBundleRecords(source, TARGET, true), 1024);
             assertThat(view).isNotNull();
             assertThat(view.root().getVector(1)).isSameAs(source.getVector(0));
             assertThat(view.root().getSchema().getFields().get(1).isNullable()).isTrue();
@@ -70,7 +84,10 @@ class MosaicArrowBatchViewTest {
         try (RootAllocator allocator = new RootAllocator();
                 VectorSchemaRoot source = source(allocator)) {
             long before = allocator.getAllocatedMemory();
-            assertThat(MosaicArrowBatchView.tryCreate(TARGET, source, budget)).isNull();
+            assertThat(
+                            MosaicArrowBatchView.tryCreate(
+                                    TARGET, new ArrowBundleRecords(source, TARGET, true), budget))
+                    .isNull();
             assertThat(allocator.getAllocatedMemory()).isEqualTo(before);
             assertThat(((IntVector) source.getVector(0)).get(0)).isEqualTo(41);
         }
@@ -87,9 +104,69 @@ class MosaicArrowBatchViewTest {
                             RowType.builder()
                                     .field("missing", DataTypes.ARRAY(DataTypes.INT()))
                                     .build())) {
-                assertThat(MosaicArrowBatchView.tryCreate(type, source, 1024)).isNull();
+                assertThat(
+                                MosaicArrowBatchView.tryCreate(
+                                        type, new ArrowBundleRecords(source, type, true), 1024))
+                        .isNull();
             }
         }
+    }
+
+    @ParameterizedTest
+    @MethodSource("layouts")
+    void testExactLayout(List<Field> expected, List<Field> actual, boolean compatible) {
+        assertThat(MosaicArrowBatchView.matches(expected, actual)).isEqualTo(compatible);
+    }
+
+    private static Stream<Arguments> layouts() {
+        Field a = ArrowUtils.toArrowField("a", 0, DataTypes.INT(), 0);
+        Field b = ArrowUtils.toArrowField("b", 1, DataTypes.INT(), 0);
+        Field differentType = ArrowUtils.toArrowField("a", 0, DataTypes.BIGINT(), 0);
+        List<Field> expected = asList(a, b);
+        return Stream.of(
+                arguments(expected, expected, true),
+                arguments(
+                        expected,
+                        asList(new Field("a", FieldType.nullable(a.getType()), null), b),
+                        true),
+                arguments(expected, singletonList(a), false),
+                arguments(expected, asList(new Field("renamed", a.getFieldType(), null), b), false),
+                arguments(expected, asList(differentType, b), false),
+                arguments(
+                        expected,
+                        asList(ArrowUtils.toArrowField("a", 0, DataTypes.INT().notNull(), 0), b),
+                        false),
+                arguments(
+                        expected,
+                        asList(
+                                new Field(
+                                        "a",
+                                        new FieldType(
+                                                true,
+                                                a.getType(),
+                                                new DictionaryEncoding(
+                                                        1, false, new ArrowType.Int(32, true))),
+                                        null),
+                                b),
+                        false),
+                arguments(
+                        expected,
+                        asList(ArrowUtils.toArrowField("a", 7, DataTypes.INT(), 0), b),
+                        false),
+                arguments(expected, asList(b, a), false),
+                arguments(
+                        singletonList(
+                                new Field(
+                                        "row",
+                                        FieldType.nullable(ArrowType.Struct.INSTANCE),
+                                        singletonList(a))),
+                        singletonList(
+                                new Field(
+                                        "row",
+                                        FieldType.nullable(ArrowType.Struct.INSTANCE),
+                                        singletonList(differentType))),
+                        false),
+                arguments(asList(a, a), asList(a, a), false));
     }
 
     private static VectorSchemaRoot source(RootAllocator allocator) {

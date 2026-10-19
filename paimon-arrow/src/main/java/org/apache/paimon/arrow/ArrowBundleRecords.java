@@ -56,6 +56,10 @@ public class ArrowBundleRecords implements BundleRecords {
         return rowType;
     }
 
+    public boolean isCaseSensitive() {
+        return caseSensitive;
+    }
+
     /**
      * Returns whether row iteration reads every Arrow vector at the same position without name
      * remapping or synthesized null columns.

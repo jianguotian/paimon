@@ -18,8 +18,8 @@
 
 package org.apache.paimon.format.mosaic;
 
+import org.apache.paimon.arrow.ArrowBundleRecords;
 import org.apache.paimon.arrow.ArrowUtils;
-import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -39,43 +39,84 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.utils.ExceptionUtils.rethrow;
+import static org.apache.paimon.utils.IOUtils.closeAll;
 
 /** Synchronous write view owning only its bounded NULL-column padding. */
 final class MosaicArrowBatchView implements AutoCloseable {
 
-    private final List<FieldVector> owned = new ArrayList<>();
+    private final List<AutoCloseable> owned = new ArrayList<>();
     @Nullable private BufferAllocator paddingAllocator;
     private VectorSchemaRoot root;
     private boolean closed;
 
     private MosaicArrowBatchView() {}
 
+    private static List<Field> fields(RowType type) {
+        return type.getFields().stream()
+                .map(f -> ArrowUtils.toArrowField(f.name(), f.id(), f.type(), 0))
+                .collect(Collectors.toList());
+    }
+
+    static boolean matches(RowType expected, Schema actual) {
+        return matches(fields(expected), actual.getFields());
+    }
+
+    static boolean matches(List<Field> expected, List<Field> actual) {
+        if (expected.size() != actual.size()) {
+            return false;
+        }
+        Set<String> names = new HashSet<>();
+        for (int i = 0; i < expected.size(); i++) {
+            Field left = expected.get(i);
+            Field right = actual.get(i);
+            if (!names.add(right.getName())
+                    || !compatible(left, right)
+                    || left.isNullable() != right.isNullable()
+                    || !matches(left.getChildren(), right.getChildren())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean compatible(Field expected, Field actual) {
+        // Mosaic may omit metadata; retained metadata (including field IDs) must agree.
+        return expected.getName().equals(actual.getName())
+                && expected.getType().equals(actual.getType())
+                && Objects.equals(expected.getDictionary(), actual.getDictionary())
+                && (actual.getMetadata().isEmpty()
+                        || Objects.equals(expected.getMetadata(), actual.getMetadata()));
+    }
+
     static boolean canProject(RowType type, Schema source) {
+        return canProject(fields(type), source.getFields());
+    }
+
+    private static boolean canProject(List<Field> expected, List<Field> source) {
         Map<String, Field> fields = new HashMap<>();
-        for (Field field : source.getFields()) {
+        for (Field field : source) {
             if (fields.put(field.getName(), field) != null) {
                 return false;
             }
         }
         Set<String> names = new HashSet<>();
-        for (DataField data : type.getFields()) {
-            Field expected = ArrowUtils.toArrowField(data.name(), data.id(), data.type(), 0);
-            if (!names.add(expected.getName())
-                    || !expected.getChildren().isEmpty()
-                    || expected.getDictionary() != null) {
+        for (Field field : expected) {
+            if (!names.add(field.getName())
+                    || !field.getChildren().isEmpty()
+                    || field.getDictionary() != null) {
                 return false;
             }
-            Field actual = fields.get(expected.getName());
+            Field actual = fields.get(field.getName());
             if (actual == null) {
-                if (!expected.isNullable()) {
+                if (!field.isNullable()) {
                     return false;
                 }
-            } else if (!expected.getType().equals(actual.getType())
+            } else if (!compatible(field, actual)
                     || !actual.getChildren().isEmpty()
-                    || actual.getDictionary() != null
-                    || (!expected.isNullable() && actual.isNullable())
-                    || (!actual.getMetadata().isEmpty()
-                            && !Objects.equals(expected.getMetadata(), actual.getMetadata()))) {
+                    || (!field.isNullable() && actual.isNullable())) {
                 return false;
             }
         }
@@ -84,23 +125,31 @@ final class MosaicArrowBatchView implements AutoCloseable {
 
     @Nullable
     static MosaicArrowBatchView tryCreate(
-            RowType type, VectorSchemaRoot source, long maxPaddingBytes) {
-        if (source.getFieldVectors().isEmpty()
-                || !canProject(type, source.getSchema())
+            RowType type, ArrowBundleRecords bundle, long maxPaddingBytes) {
+        VectorSchemaRoot source = bundle.getVectorSchemaRoot();
+        if (!type.equals(bundle.getRowType())
+                || source.getFieldVectors().isEmpty()
                 || !ArrowUtils.hasSameRootAllocator(source, source.getVector(0).getAllocator())) {
             return null;
         }
+        List<Field> expected = fields(type);
         MosaicArrowBatchView view = new MosaicArrowBatchView();
+        if (bundle.hasIdentityMapping() && matches(expected, source.getSchema().getFields())) {
+            view.root = source;
+            return view;
+        }
+        // Projection below uses exact names, matching the Mosaic reader's row view.
+        if (!bundle.isCaseSensitive() || !canProject(expected, source.getSchema().getFields())) {
+            return null;
+        }
         try {
             Map<String, FieldVector> sourceVectors = new HashMap<>();
             for (FieldVector vector : source.getFieldVectors()) {
                 sourceVectors.put(vector.getName(), vector);
             }
-            List<Field> fields = new ArrayList<>();
             List<FieldVector> vectors = new ArrayList<>();
-            for (DataField data : type.getFields()) {
-                Field expected = ArrowUtils.toArrowField(data.name(), data.id(), data.type(), 0);
-                FieldVector vector = sourceVectors.get(data.name());
+            for (Field field : expected) {
+                FieldVector vector = sourceVectors.get(field.getName());
                 if (vector == null) {
                     if (view.paddingAllocator == null) {
                         view.paddingAllocator =
@@ -111,16 +160,15 @@ final class MosaicArrowBatchView implements AutoCloseable {
                                                 0,
                                                 Math.max(0, maxPaddingBytes));
                     }
-                    vector = expected.createVector(view.paddingAllocator);
+                    vector = field.createVector(view.paddingAllocator);
                     view.owned.add(vector);
                     vector.setInitialCapacity(source.getRowCount());
                     vector.allocateNew();
                     vector.setValueCount(source.getRowCount());
                 }
-                fields.add(expected);
                 vectors.add(vector);
             }
-            view.root = new VectorSchemaRoot(fields, vectors, source.getRowCount());
+            view.root = new VectorSchemaRoot(expected, vectors, source.getRowCount());
             return view;
         } catch (OutOfMemoryException | OversizedAllocationException allocationFailure) {
             // No native write has started: release padding and use the ordinary writer path.
@@ -146,35 +194,12 @@ final class MosaicArrowBatchView implements AutoCloseable {
             return;
         }
         closed = true;
-        Throwable failure = null;
-        for (FieldVector vector : owned) {
-            try {
-                vector.close();
-            } catch (Throwable t) {
-                if (failure == null) {
-                    failure = t;
-                } else {
-                    failure.addSuppressed(t);
-                }
-            }
-        }
+        // Release only padding, then its allocator. Existing vectors still belong to the reader.
+        owned.add(paddingAllocator);
         try {
-            if (paddingAllocator != null) {
-                paddingAllocator.close();
-            }
-        } catch (Throwable t) {
-            if (failure == null) {
-                failure = t;
-            } else {
-                failure.addSuppressed(t);
-            }
-        }
-        // Do not close root: its existing vectors are still owned by the reader.
-        if (failure instanceof Error) {
-            throw (Error) failure;
-        }
-        if (failure != null) {
-            throw (RuntimeException) failure;
+            closeAll(owned, Throwable.class);
+        } catch (Exception e) {
+            rethrow(e);
         }
     }
 }
