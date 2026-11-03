@@ -1,0 +1,73 @@
+name: Mosaic 0.3.0 upgrade validation
+
+on:
+  push:
+    branches: [validation/mosaic-030-20261103]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Java ${{ matrix.java }} / ${{ matrix.profiles }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - java: '8'
+            profiles: flink1,spark3
+            tests: '*Mosaic*Test,Arrow*Test,OneElementFieldVectorGeneratorTest'
+          - java: '11'
+            profiles: flink2,spark3
+            tests: '*Mosaic*Test,Arrow*Test,OneElementFieldVectorGeneratorTest'
+          - java: '17'
+            profiles: spark4,flink1
+            tests: '*Mosaic*Test'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 7d0b39a10e1f8d41c30d562ca699f736e486c593
+          persist-credentials: false
+      - name: Verify the exact PR revision
+        run: |
+          test "$(git rev-parse HEAD)" = 7d0b39a10e1f8d41c30d562ca699f736e486c593
+          git log -1 --format=fuller
+          uname -m
+      - uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+          cache: maven
+      - name: Build dependencies and run native integration tests
+        env:
+          MAVEN_OPTS: -Xmx4g -Duser.timezone=UTC
+          BUILD_PROFILES: ${{ matrix.profiles }}
+          TEST_FILTER: ${{ matrix.tests }}
+        run: |
+          mvn -B -ntp -P"$BUILD_PROFILES" -pl paimon-mosaic -am \
+            -Dtest="$TEST_FILTER" -DwildcardSuites=none \
+            -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false \
+            -Dflink.forkCount=2 clean verify
+      - name: Require actual Mosaic execution with no skipped native tests
+        run: |
+          python3 - <<'PY'
+          import glob
+          import xml.etree.ElementTree as ET
+          totals = dict(tests=0, failures=0, errors=0, skipped=0)
+          for path in glob.glob('paimon-mosaic/target/surefire-reports/TEST-*.xml'):
+              suite = ET.parse(path).getroot()
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          print(totals)
+          assert totals == dict(tests=84, failures=0, errors=0, skipped=0), totals
+          PY
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: mosaic-upgrade-java-${{ matrix.java }}
+          path: '**/target/surefire-reports/**'
+          if-no-files-found: warn
+          retention-days: 7
