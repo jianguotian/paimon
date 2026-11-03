@@ -1,6 +1,7 @@
 name: Mosaic 0.3.0 upgrade validation
 
 on:
+  workflow_dispatch:
   push:
     branches: [validation/mosaic-030-20261103]
 
