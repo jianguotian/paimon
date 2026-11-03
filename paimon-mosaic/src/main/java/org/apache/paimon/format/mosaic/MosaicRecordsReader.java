@@ -74,7 +74,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             RowType dataSchemaRowType,
             RowType projectedRowType,
             @Nullable List<Predicate> predicates,
-            Path filePath) {
+            Path filePath)
+            throws IOException {
         this(
                 inputFileAdapter,
                 fileSize,
@@ -94,7 +95,8 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             @Nullable List<Predicate> predicates,
             Path filePath,
             BufferAllocator allocator,
-            NativeReaderOpener nativeReaderOpener) {
+            NativeReaderOpener nativeReaderOpener)
+            throws IOException {
         this.filePath = filePath;
         this.inputFileAdapter = inputFileAdapter;
         this.dataSchemaRowType = dataSchemaRowType;
@@ -130,6 +132,9 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
             createdArrowBatchReader = new ArrowBatchReader(projectedRowType, true);
         } catch (Throwable t) {
             closeOnConstructionFailure(t, createdReader, allocator, inputFileAdapter);
+            if (t instanceof IOException) {
+                throw (IOException) t;
+            }
             throw rethrowUnchecked(t);
         }
 
@@ -367,6 +372,7 @@ public class MosaicRecordsReader implements FileRecordReader<InternalRow> {
     interface NativeReaderOpener {
 
         MosaicReader open(
-                MosaicInputFileAdapter inputFileAdapter, long fileSize, BufferAllocator allocator);
+                MosaicInputFileAdapter inputFileAdapter, long fileSize, BufferAllocator allocator)
+                throws IOException;
     }
 }
