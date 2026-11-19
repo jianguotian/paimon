@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pypaimon.common.options.options import Options
 from pypaimon.read.read_type import OutputProjection
 
 from pypaimon.read.stream_read_builder import StreamReadBuilder
@@ -58,7 +57,6 @@ def builder(mock_table):
 def mock_scan_table():
     """Create mock table for AsyncStreamingTableScan."""
     table = MagicMock()
-    table.options.options = Options({})
     table.options.changelog_producer.return_value = MagicMock()
     table.file_io = MagicMock()
     table.table_path = "/tmp/test"

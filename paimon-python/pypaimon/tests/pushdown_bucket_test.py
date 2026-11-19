@@ -782,9 +782,10 @@ class BucketPruningIntegrationTest(unittest.TestCase):
             commit.close()
 
         predicate = table.new_read_builder().new_predicate_builder().equal('id', 1)
-        with self.subTest(scan='batch'):
-            rows, _ = self._read_with(table, predicate)
-            self.assertEqual(rows, [{'id': 1}])
+        for options in ({}, {'scan.native-plan.enabled': 'false'}):
+            with self.subTest(batch_options=options):
+                rows, _ = self._read_with(table.copy(options), predicate)
+                self.assertEqual(rows, [{'id': 1}])
         with self.subTest(scan='stream'):
             stream = table.new_stream_read_builder().with_filter(predicate)
             scan = stream.new_streaming_scan()
