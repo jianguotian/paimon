@@ -763,7 +763,7 @@ class BucketPruningIntegrationTest(unittest.TestCase):
                          "Equal on PK still narrows to the writer's bucket "
                          "even when AND'd with a non-bucket-key predicate")
 
-    @pytest.mark.python_plan
+    @pytest.mark.execution_defaults
     def test_point_lookup_with_custom_bucket_provider(self):
         data = pa.table({'id': pa.array([1, 2], type=pa.int32())})
         schema = Schema.from_pyarrow_schema(data.schema, options={
@@ -782,8 +782,17 @@ class BucketPruningIntegrationTest(unittest.TestCase):
             commit.close()
 
         predicate = table.new_read_builder().new_predicate_builder().equal('id', 1)
-        rows, _ = self._read_with(table, predicate)
-        self.assertEqual(rows, [{'id': 1}])
+        with self.subTest(scan='batch'):
+            rows, _ = self._read_with(table, predicate)
+            self.assertEqual(rows, [{'id': 1}])
+        with self.subTest(scan='stream'):
+            stream = table.new_stream_read_builder().with_filter(predicate)
+            scan = stream.new_streaming_scan()
+            try:
+                splits = scan.plan().splits()
+                self.assertEqual(stream.new_read().to_arrow(splits).to_pylist(), [{'id': 1}])
+            finally:
+                scan.close()
 
     @pytest.mark.python_plan
     def test_manifest_bucket_pruning_skips_file_reads(self):
