@@ -10,7 +10,7 @@ This PyPi package contains the Python APIs for using Paimon.
 
 Pypaimon requires Python 3.6+.
 
-On Python 3.10+, `pip install pypaimon` also installs `pypaimon-rust>=0.5.0`.
+On Python 3.10+, `pip install pypaimon` also installs `pypaimon-rust>=0.6.0`.
 Native split planning, reads, writes, updates and commits are enabled by default
 for supported operations. Older Python versions and unsupported operations use
 Python execution. To select Python execution explicitly, set

@@ -163,7 +163,7 @@ jobs:
               from packaging.version import Version
               import pypaimon_rust.datafusion
 
-              assert Version(version('pypaimon-rust')) >= Version('0.5.0')
+              assert Version(version('pypaimon-rust')) >= Version('0.6.0')
               print('pypaimon-rust', version('pypaimon-rust'))
           else:
               assert importlib.util.find_spec('pypaimon_rust') is None
