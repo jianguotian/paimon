@@ -20,7 +20,6 @@ from typing import Dict, List, Optional
 
 from pypaimon.common.file_io import FileIO
 from pypaimon.common.identifier import Identifier
-from pypaimon.common.options.options_utils import OptionsUtils
 from pypaimon.schema.table_schema import TableSchema
 from pypaimon.table.table import Table
 
@@ -54,7 +53,6 @@ class FormatTable(Table):
         format: Format,
         options: Optional[Dict[str, str]] = None,
         comment: Optional[str] = None,
-        catalog_case_sensitive: Optional[str] = None,
     ):
         self.file_io = file_io
         self.identifier = identifier
@@ -62,10 +60,6 @@ class FormatTable(Table):
         self._location = location.rstrip("/")
         self._format = format
         self._options = options or dict(table_schema.options)
-        if catalog_case_sensitive is None:
-            catalog_case_sensitive = self._options.get(
-                "case-sensitive", self._options.get("allow-upper-case", "true"))
-        self.case_sensitive = OptionsUtils.convert_to_boolean(catalog_case_sensitive)
         self.comment = comment
         self.fields = table_schema.fields
         self.field_names = [f.name for f in self.fields]
@@ -94,21 +88,6 @@ class FormatTable(Table):
 
     def options(self) -> Dict[str, str]:
         return self._options
-
-    def projected_fields(self, projection):
-        if not projection:
-            return list(self.fields)
-        key = str if self.case_sensitive else str.lower
-        by_name = {}
-        for field in self.fields:
-            by_name.setdefault(key(field.name), []).append(field)
-        result = []
-        for name in projection:
-            matches = by_name[key(name)]
-            if len(matches) != 1:
-                raise ValueError(f"Ambiguous column {name!r} in {self.full_name()}")
-            result.append(matches[0])
-        return result
 
     def new_read_builder(self):
         from pypaimon.table.format.format_read_builder import FormatReadBuilder

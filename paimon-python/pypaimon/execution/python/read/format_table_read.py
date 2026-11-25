@@ -19,7 +19,6 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import pyarrow
 
-from pypaimon.common.options.options_utils import OptionsUtils
 from pypaimon.schema.data_types import PyarrowFieldParser
 from pypaimon.table.format.format_data_split import FormatDataSplit
 from pypaimon.table.format.format_table import FormatTable, Format
@@ -39,151 +38,83 @@ def _text_format_schema_column(table: FormatTable) -> Optional[str]:
     )
 
 
-def _columnar_read_schema(
-    table: FormatTable, projection: Optional[List[str]]
-) -> Optional[pyarrow.Schema]:
+def _columnar_projection(table, projection, splits):
     if table.format() not in (Format.PARQUET, Format.ORC):
-        return None
-    return PyarrowFieldParser.from_paimon_schema(table.projected_fields(projection))
+        return None, None
+    fields = table.fields
+    table_names = set(table.field_names)
+    if projection:
+        by_name = {field.name: field for field in fields}
+        fields = [by_name[name] for name in projection]
 
+    # A missing column must match its on-disk Arrow type in the other splits
+    # (e.g. ORC timestamps read back as ns regardless of their declared precision).
+    physical_fields = {}
+    pending = iter(reversed(splits))
 
-def _field_index(fields, name, path):
-    indices = fields.get_all_field_indices(name)
-    if len(indices) > 1:
-        raise ValueError(f"Ambiguous column {name!r} in {path}")
-    return indices[0] if indices else None
-
-
-def _align_array(array, target, name_key, positional_levels, fmt, path):
-    """Resolve nested fields explicitly; older Arrow casts cannot reorder struct children."""
-    source = array.type
-    if source == target:
-        return array
-
-    def child(values, child_type):
-        return _align_array(values, child_type, name_key, positional_levels - 1, fmt, path)
-
-    types = pyarrow.types
-    if types.is_struct(source) and types.is_struct(target):
-        names = pyarrow.schema([field.with_name(name_key(field.name)) for field in source])
-        source_children = array.flatten()
-        children = []
-        for i, field in enumerate(target):
-            index = i if positional_levels > 0 else _field_index(names, name_key(field.name), path)
-            if index is None or index >= len(source):
-                if not field.nullable and array.null_count != len(array):
-                    raise ValueError(f"Missing required column {field.name!r} in {path}")
-                values = pyarrow.nulls(len(array), field.type)
-            else:
-                values = child(source_children[index], field.type)
-                if not field.nullable and values.null_count:
-                    import pyarrow.compute as pc
-                    if pc.any(pc.and_(array.is_valid(), values.is_null())).as_py():
-                        raise ValueError(f"Null in required column {field.name!r} in {path}")
-            children.append(values)
-        return pyarrow.StructArray.from_arrays(children, fields=list(target), mask=array.is_null())
-
-    if types.is_map(source) and types.is_map(target):
-        keys = child(array.keys, target.key_type)
-        items = child(array.items, target.item_type)
-        if not target.item_field.nullable and items.null_count:
-            entries = array.view(pyarrow.list_(source.field(0))).flatten()
-            if entries.field(1).null_count:
-                raise ValueError(f"Null in required map value in {path}")
-        entries = pyarrow.StructArray.from_arrays([keys, items], fields=[target.key_field, target.item_field])
-        return pyarrow.Array.from_buffers(target, len(array), array.buffers()[:source.num_buffers],
-                                          offset=array.offset, children=[entries])
-
-    list_types = (pyarrow.ListType, pyarrow.LargeListType, pyarrow.FixedSizeListType)
-    if isinstance(source, list_types) and isinstance(target, list_types):
-        values = child(array.values, target.value_type)
-        if not target.value_field.nullable and values.null_count and array.flatten().null_count:
-            raise ValueError(f"Null in required list element in {path}")
-        if types.is_large_list(source):
-            layout = pyarrow.large_list(target.value_field)
-        elif types.is_fixed_size_list(source):
-            layout = pyarrow.list_(target.value_field, source.list_size)
-        else:
-            layout = pyarrow.list_(target.value_field)
-        result = pyarrow.Array.from_buffers(layout, len(array), array.buffers()[:source.num_buffers],
-                                            offset=array.offset, children=[values])
-        return result.cast(target)
-
-    if fmt == Format.ORC and types.is_int32(source) and types.is_time(target):
-        # Paimon stores ORC TIME as milliseconds since midnight.
-        array = array.cast(pyarrow.time32("ms"))
-    return array.cast(target)
-
-
-def _align_columnar_table(tbl, schema, table, split):
-    positional_levels = 0
-    options = table.options()
-    if table.format() == Format.ORC and OptionsUtils.convert_to_boolean(
-            options.get("orc.force.positional.evolution", False)):
-        positional_levels = int(options.get("orc.force.positional.evolution.level", 1))
-
-    if positional_levels <= 0 and tbl.schema.equals(schema) and all(
-            field.nullable or not column.null_count for field, column in zip(schema, tbl.columns)):
-        return tbl
-
-    def name_key(name):
-        return name if table.case_sensitive else name.lower()
-
-    file_names = pyarrow.schema([field.with_name(name_key(field.name)) for field in tbl.schema])
-    positions = {}
-    partition_keys = {name_key(k) for k in table.partition_keys}
-    if positional_levels > 0:
-        # ORC ordinals refer to the full data schema, before projection or partition injection.
-        data_names = (name for name in table.field_names if name_key(name) not in partition_keys)
-        data_indices = (i for i, name in enumerate(file_names.names) if name not in partition_keys)
-        positions = dict(zip(data_names, data_indices))
-
-    arrays = []
-    for field in schema:
-        key = name_key(field.name)
-        if positional_levels > 0 and key not in partition_keys:
-            index = positions.get(field.name)
-        else:
-            index = _field_index(file_names, key, split.data_path())
-
-        if index is not None:
-            column = tbl.column(index)
-            if column.type != field.type:
-                chunks = [_align_array(chunk, field.type, name_key, positional_levels - 1,
-                                       table.format(), split.data_path()) for chunk in column.chunks]
-                column = pyarrow.chunked_array(chunks, type=field.type)
-        elif split.partition and field.name in split.partition:
-            value = split.partition[field.name]
-            text = None if value is None else str(value)
-            column = pyarrow.array([text] * tbl.num_rows, type=pyarrow.string()).cast(field.type)
-        elif field.nullable:
-            column = pyarrow.nulls(tbl.num_rows, type=field.type)
-        else:
+    def missing_field(field, split):
+        if not field.type.nullable:
             raise ValueError(f"Missing required column {field.name!r} in {split.data_path()}")
-        if not field.nullable and column.null_count:
-            raise ValueError(f"Null in required column {field.name!r} in {split.data_path()}")
-        arrays.append(column)
-    return pyarrow.Table.from_arrays(arrays, schema=schema)
+        if field.name not in physical_fields:
+            for other in pending:
+                if other == split or not other.file_size:
+                    continue
+                try:
+                    with table.file_io.new_input_stream(other.data_path()) as stream:
+                        if table.format() == Format.PARQUET:
+                            import pyarrow.parquet as pq
+                            schema = pq.read_schema(stream)
+                        else:
+                            import pyarrow.orc as orc
+                            schema = orc.ORCFile(stream).schema
+                except (OSError, pyarrow.ArrowException):
+                    # Report unreadable files only when the reader actually reaches them.
+                    continue
+                physical_fields.update((f.name, f) for f in schema)
+                if field.name in physical_fields:
+                    break
+        return physical_fields.get(field.name) or PyarrowFieldParser.from_paimon_field(field)
+
+    def project(tbl, split):
+        schema = tbl.schema
+        names = set(schema.names)
+        if not names.issubset(table_names):
+            # Renamed or positional files are outside additive schema evolution.
+            return None
+        physical_fields.update((field.name, field) for field in schema)
+        arrays, output_fields = [], []
+        for field in fields:
+            name = field.name
+            if name in names:
+                column, arrow_field = tbl[name], schema.field(name)
+            else:
+                arrow_field = missing_field(field, split)
+                column = pyarrow.nulls(tbl.num_rows, type=arrow_field.type)
+            arrays.append(column)
+            output_fields.append(arrow_field.with_nullable(True) if field.type.nullable else arrow_field)
+        return pyarrow.Table.from_arrays(arrays, schema=pyarrow.schema(output_fields, metadata=schema.metadata))
+
+    return fields, project
 
 
 def _read_file_to_arrow(
-    table: FormatTable,
+    file_io: Any,
     split: FormatDataSplit,
+    fmt: Format,
+    partition_spec: Optional[Dict[str, str]],
     read_fields: Optional[List[str]],
     partition_key_types: Optional[Dict[str, pyarrow.DataType]] = None,
-    columnar_schema: Optional[pyarrow.Schema] = None,
     text_column_name: Optional[str] = None,
     text_line_delimiter: str = "\n",
+    columnar_projection=None,
 ) -> pyarrow.Table:
     path = split.data_path()
-    fmt = table.format()
-    partition_spec = split.partition
     csv_read_options = None
     if fmt == Format.CSV:
         import pyarrow.csv as csv
         csv_read_options = csv.ReadOptions(block_size=1 << 20)
     try:
-        with table.file_io.new_input_stream(path) as stream:
+        with file_io.new_input_stream(path) as stream:
             chunks = []
             while True:
                 chunk = stream.read()
@@ -258,9 +189,6 @@ def _read_file_to_arrow(
     else:
         raise ValueError(f"Format {fmt} read not implemented in Python")
 
-    if columnar_schema is not None:
-        return _align_columnar_table(tbl, columnar_schema, table, split)
-
     if partition_spec:
         for k, v in partition_spec.items():
             if k in tbl.column_names:
@@ -274,6 +202,11 @@ def _read_file_to_arrow(
             if pa_type != pyarrow.string():
                 arr = arr.cast(pa_type)
             tbl = tbl.append_column(k, arr)
+
+    if columnar_projection is not None:
+        projected = columnar_projection(tbl, split)
+        if projected is not None:
+            return projected
 
     if read_fields and tbl.num_columns > 0:
         existing = [c for c in read_fields if c in tbl.column_names]
@@ -302,7 +235,7 @@ def to_arrow(
 ) -> pyarrow.Table:
     read_fields = self.projection
     fmt = self.table.format()
-    columnar_schema = _columnar_read_schema(self.table, self.projection)
+    columnar_fields, project = _columnar_projection(self.table, read_fields, splits)
     partition_key_types = _partition_key_types(self.table)
     text_col = (
         _text_format_schema_column(self.table)
@@ -318,13 +251,15 @@ def to_arrow(
     nrows = 0
     for split in splits:
         t = _read_file_to_arrow(
-            self.table,
+            self.table.file_io,
             split,
+            fmt,
+            split.partition,
             read_fields,
             partition_key_types,
-            columnar_schema=columnar_schema,
             text_column_name=text_col,
             text_line_delimiter=text_delim,
+            columnar_projection=project,
         )
         if t.num_rows > 0:
             tables.append(t)
@@ -336,8 +271,8 @@ def to_arrow(
                     tables[-1] = last.slice(0, last.num_rows - excess)
                 break
     if not tables:
-        if columnar_schema is not None:
-            return columnar_schema.empty_table()
+        if columnar_fields is not None:
+            return PyarrowFieldParser.from_paimon_schema(columnar_fields).empty_table()
         fields = self.table.fields
         if read_fields:
             fields = [
@@ -358,9 +293,9 @@ def to_iterator(
     self,
     splits: List[FormatDataSplit],
 ) -> Iterator[Any]:
-    columnar_schema = _columnar_read_schema(self.table, self.projection)
     partition_key_types = _partition_key_types(self.table)
     fmt = self.table.format()
+    _, project = _columnar_projection(self.table, self.projection, splits)
     text_col = (
         _text_format_schema_column(self.table)
         if fmt == Format.TEXT
@@ -376,13 +311,15 @@ def to_iterator(
         if self.limit is not None and n_yielded >= self.limit:
             break
         t = _read_file_to_arrow(
-            self.table,
+            self.table.file_io,
             split,
+            fmt,
+            split.partition,
             self.projection,
             partition_key_types,
-            columnar_schema=columnar_schema,
             text_column_name=text_col,
             text_line_delimiter=text_delim,
+            columnar_projection=project,
         )
         for batch in t.to_batches():
             for i in range(batch.num_rows):

@@ -717,13 +717,6 @@ class PyarrowFieldParser:
             elif type_name == 'DATE':
                 return pyarrow.date32()
             if type_name.startswith('TIME'):
-                match = re.fullmatch(r'TIME\((\d+)\)', type_name)
-                if match:
-                    precision = int(match.group(1))
-                    if 4 <= precision <= 6:
-                        return pyarrow.time64('us')
-                    if 7 <= precision <= 9:
-                        return pyarrow.time64('ns')
                 return pyarrow.time32('ms')
         elif isinstance(data_type, ArrayType):
             element_type = PyarrowFieldParser.from_paimon_type(data_type.element)
@@ -736,9 +729,6 @@ class PyarrowFieldParser:
             )
         elif isinstance(data_type, VectorType):
             return pyarrow.list_(PyarrowFieldParser.from_paimon_type(data_type.element), data_type.length)
-        elif isinstance(data_type, MultisetType):
-            return pyarrow.map_(PyarrowFieldParser.from_paimon_type(data_type.element),
-                                pyarrow.field("value", pyarrow.int32(), nullable=False))
         elif isinstance(data_type, MapType):
             key_type = PyarrowFieldParser.from_paimon_type(data_type.key)
             value_type = PyarrowFieldParser.from_paimon_type(data_type.value)
@@ -812,8 +802,7 @@ class PyarrowFieldParser:
         elif types.is_date32(pa_type):
             type_name = 'DATE'
         elif types.is_time(pa_type):
-            precision = {'s': 0, 'ms': 0, 'us': 6, 'ns': 9}[pa_type.unit]
-            type_name = f'TIME({precision})'
+            type_name = 'TIME(0)'
         elif types.is_fixed_size_list(pa_type):
             pa_type: pyarrow.FixedSizeListType
             element_type = PyarrowFieldParser.to_paimon_type(pa_type.value_type, pa_type.value_field.nullable)

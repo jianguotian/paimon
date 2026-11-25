@@ -940,7 +940,6 @@ class RESTCatalog(Catalog):
         file_io = data_file_io(location)
         file_format = schema.options.get(CoreOptions.FILE_FORMAT.key(), "parquet")
         fmt = Format.parse(file_format)
-        catalog_options = self.context.options.to_map()
         return FormatTable(
             file_io=file_io,
             identifier=identifier,
@@ -949,8 +948,6 @@ class RESTCatalog(Catalog):
             format=fmt,
             options=dict(schema.options),
             comment=schema.comment,
-            catalog_case_sensitive=catalog_options.get(
-                "case-sensitive", catalog_options.get("allow-upper-case")),
         )
 
     def _create_iceberg_table(self,
