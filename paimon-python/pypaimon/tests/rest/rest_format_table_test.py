@@ -22,9 +22,9 @@ import pyarrow as pa
 import pytest
 from parameterized import parameterized
 
-from pypaimon import Schema
+from pypaimon import CatalogFactory, Schema
 from pypaimon.catalog.catalog_exception import TableNotExistException
-from pypaimon.schema.data_types import AtomicType
+from pypaimon.schema.data_types import AtomicType, DataField, MultisetType
 from pypaimon.schema.schema_change import SchemaChange
 from pypaimon.table.format import FormatTable
 from pypaimon.tests.rest.rest_base_test import RESTBaseTest
@@ -38,6 +38,27 @@ def _format_table_read_write_formats():
 
 
 class RESTFormatTableTest(RESTBaseTest):
+
+    @staticmethod
+    def _write_arrow(table, data):
+        builder = table.new_batch_write_builder()
+        writer, commit = builder.new_write(), builder.new_commit()
+        try:
+            writer.write_arrow(data)
+            commit.commit(writer.prepare_commit())
+        finally:
+            writer.close()
+            commit.close()
+
+    def _assert_format_read(self, table, expected, projection=None):
+        builder = table.new_read_builder()
+        if projection is not None:
+            builder.with_projection(projection)
+        self.assertEqual([field.name for field in builder.read_type()], expected.column_names)
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read()
+        self.assertEqual(reader.to_arrow(splits), expected)
+        self.assertEqual(pa.Table.from_batches(list(reader.to_iterator(splits))), expected)
 
     @parameterized.expand(_format_table_read_write_formats())
     def test_format_table_read_write(self, file_format):
@@ -101,22 +122,13 @@ class RESTFormatTableTest(RESTBaseTest):
         )
         self.rest_catalog.create_table(name, schema, False)
 
-        def write(data):
-            builder = self.rest_catalog.get_table(name).new_batch_write_builder()
-            writer, commit = builder.new_write(), builder.new_commit()
-            try:
-                writer.write_arrow(data)
-                commit.commit(writer.prepare_commit())
-            finally:
-                writer.close()
-                commit.close()
-
-        write(pa.table({"id": [1, 2]}))
+        self._write_arrow(self.rest_catalog.get_table(name), pa.table({"id": [1, 2]}))
         self.rest_catalog.alter_table(
             name, [SchemaChange.add_column("campaign", AtomicType("STRING"))])
-        write(pa.table({"id": [3], "campaign": ["spring"]}, schema=pa.schema([
+        updated = pa.table({"id": [3], "campaign": ["spring"]}, schema=pa.schema([
             pa.field("id", pa.int64()), pa.field("campaign", pa.string(), nullable=False),
-        ])))
+        ]))
+        self._write_arrow(self.rest_catalog.get_table(name), updated)
 
         table = self.rest_catalog.get_table(name)
         builder = table.new_read_builder()
@@ -129,6 +141,99 @@ class RESTFormatTableTest(RESTBaseTest):
         self.assertTrue(all(batch.schema.names == ["campaign"] for batch in batches))
         actual = pa.Table.from_batches(batches)
         self.assertCountEqual(actual.column("campaign").to_pylist(), [None, None, "spring"])
+
+    @parameterized.expand([("parquet",), ("orc",)])
+    def test_columnar_case_sensitive_catalog(self, file_format):
+        if file_format == "orc":
+            pytest.importorskip("pyarrow.orc")
+        name = "default.mixed_case"
+        nested = pa.list_(pa.struct([("amount", pa.int32())]))
+        logical = pa.schema([("id", pa.int64()), ("items", nested), ("campaign", pa.string())])
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            logical, options={"type": "format-table", "file.format": file_format}), False)
+        table = self.rest_catalog.get_table(name)
+        items = pa.array([[{"Amount": 7}], None], type=pa.list_(pa.struct([("Amount", pa.int32())])))
+        self._write_arrow(table, pa.table({"ID": [42, 43], "items": items}))
+        self._assert_format_read(table, pa.table({"id": pa.nulls(2, pa.int64())}), ["id"])
+        catalog = CatalogFactory.create({**self.options, "case-sensitive": "false"})
+        expected = pa.table({"id": [42, 43], "items": [[{"amount": 7}], None],
+                             "campaign": [None, None]}, schema=logical)
+        table = catalog.get_table(name)
+        self._assert_format_read(table, expected)
+        projection = ["items", "campaign", "id"]
+        self._assert_format_read(table, expected.select(projection), ["Items", "Campaign", "ID"])
+
+    @parameterized.expand([(1, "named"), (2, "positional")])
+    def test_orc_positional_evolution(self, levels, nested_value):
+        pytest.importorskip("pyarrow.orc")
+        name = "default.positional"
+        nested = pa.struct([("first", pa.string()), ("second", pa.string())])
+        logical = pa.schema([("id", pa.int64()), ("pt", pa.string()),
+                             ("label", nested), ("campaign", pa.string())])
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            logical, partition_keys=["pt"], options={
+                "type": "format-table", "file.format": "orc", "orc.force.positional.evolution": "true",
+                "orc.force.positional.evolution.level": str(levels)}), False)
+        table = self.rest_catalog.get_table(name)
+        # The legacy file has no partition field. The scan supplies it from the directory.
+        import pyarrow.orc as orc
+        directory = table.location() + "/pt=west"
+        table.file_io.check_or_mkdirs(directory)
+        physical = pa.struct([("second", pa.string()), ("first", pa.string())])
+        labels = pa.array([{"second": "positional", "first": "named"}], type=physical)
+        data = pa.table({"_col0": [42], "_col1": labels})
+        buffer = pa.BufferOutputStream()
+        orc.write_table(data, buffer)
+        with table.file_io.new_output_stream(directory + "/legacy.orc") as stream:
+            stream.write(buffer.getvalue().to_pybytes())
+        label = {"first": nested_value, "second": "positional" if levels == 1 else "named"}
+        expected = pa.table({"id": [42], "pt": ["west"], "label": [label], "campaign": [None]}, schema=logical)
+        self._assert_format_read(table, expected)
+        projection = ["campaign", "label", "pt"]
+        self._assert_format_read(table, expected.select(projection), projection)
+
+    @parameterized.expand([("parquet",), ("orc",)])
+    def test_columnar_multiset(self, file_format):
+        if file_format == "orc":
+            pytest.importorskip("pyarrow.orc")
+        name = "default.multiset_table"
+        self.rest_catalog.create_table(name, Schema(
+            fields=[DataField(0, "counts", MultisetType(True, AtomicType("STRING")))],
+            options={"type": "format-table", "file.format": file_format}), False)
+        table = self.rest_catalog.get_table(name)
+        multiset = pa.map_(pa.string(), pa.field("value", pa.int32(), nullable=False))
+        expected = pa.table({"counts": pa.array([[("red", 2)], None], type=multiset)})
+        self._write_arrow(table, expected)
+        self._assert_format_read(table, expected)
+
+    def test_parquet_submillisecond_time(self):
+        name = "default.precise_time"
+        data = pa.table({"micros": pa.array([1001], pa.time64("us")),
+                         "nanos": pa.array([1001001], pa.time64("ns"))})
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            data.schema, options={"type": "format-table", "file.format": "parquet"}), False)
+        table = self.rest_catalog.get_table(name)
+        self._write_arrow(table, data)
+        self._assert_format_read(table, data)
+
+    @parameterized.expand([("parquet",), ("orc",)])
+    def test_columnar_required_field_with_null(self, file_format):
+        if file_format == "orc":
+            pytest.importorskip("pyarrow.orc")
+        name = "default.required_id"
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            pa.schema([pa.field("id", pa.int64(), nullable=False)]),
+            options={"type": "format-table", "file.format": file_format}), False)
+        table = self.rest_catalog.get_table(name)
+        self._write_arrow(table, pa.table({"id": [1, None]}))
+        builder = table.new_read_builder()
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read()
+        for read in (reader.to_arrow, lambda s: list(reader.to_iterator(s))):
+            with self.assertRaises(ValueError) as error:
+                read(splits)
+            self.assertIn("required column 'id'", str(error.exception))
+            self.assertIn(splits[0].data_path(), str(error.exception))
 
     def test_format_table_write_rolls_by_row_count(self):
         pa_schema = pa.schema([("id", pa.int32())])
