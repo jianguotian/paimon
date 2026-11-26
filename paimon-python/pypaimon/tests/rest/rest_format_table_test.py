@@ -269,6 +269,27 @@ class RESTFormatTableTest(RESTBaseTest):
             self.assertEqual(sorted(reader.to_arrow(splits).column("id").to_pylist()), ids)
             self.assertEqual([row.column(1)[0].as_py() for row in reader.to_iterator(splits)], [value] * len(ids))
 
+    @parameterized.expand([("large_string", pa.large_string(), "a%2Fb"),
+                           ("fixed_binary", pa.binary(5), b"a%2Fb"),
+                           ("large_binary", pa.large_binary(), b"a%2Fb"),
+                           ("default_marker", pa.string(), "%5F_DEFAULT_PARTITION__")])
+    def test_parquet_literal_partition_representations(self, label, physical_type, value):
+        import pyarrow.parquet as pq
+        from pypaimon.filesystem.local_file_io import LocalFileIO
+        name = "default.literal_partition"
+        schema = pa.schema([("id", pa.int64()), ("pt", physical_type)])
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            schema, partition_keys=["pt"], options={"type": "format-table", "file.format": "parquet"}), False)
+        table = self.rest_catalog.get_table(name)
+        root = LocalFileIO._to_file(table.location())
+        directory = root / ("pt=" + str(value))
+        directory.mkdir()
+        pq.write_table(pa.table({"id": [1], "pt": [value]}, schema=schema), str(directory / "old.parquet"))
+        for partition_filter in (None, {"pt": value}):
+            builder = table.new_read_builder().with_partition_filter(partition_filter)
+            splits = builder.new_scan().plan().splits()
+            self.assertEqual(builder.new_read().to_arrow(splits).column("pt").to_pylist(), [value])
+
     def test_parquet_nanosecond_partition_legacy_and_new_files(self):
         import pyarrow.parquet as pq
         name = "default.nanos_partition"

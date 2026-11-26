@@ -122,7 +122,8 @@ def _clock_with_nanoseconds(value):
 
 def _filter_splits(table, splits, partition_filter):
     import pyarrow as pa
-    from pypaimon.execution.python.read.format_table_read import _columnar_read_schema, _legacy_time_directory
+    from pypaimon.execution.python.read.format_table_read import (
+        _columnar_read_schema, _legacy_time_directory, _literal_partition_type)
 
     keys = [key for key in partition_filter if key in table.partition_keys]
     if len(keys) != len(partition_filter):
@@ -146,8 +147,8 @@ def _filter_splits(table, splits, partition_filter):
                     residual[key] = requested
                 elif clock != ns_filters[key]:
                     break
-            elif split.raw_partition and key in split.raw_partition and key in fields and (
-                    pa.types.is_string(fields[key].type) or pa.types.is_binary(fields[key].type)):
+            elif (split.raw_partition and key in split.raw_partition and key in fields
+                  and _literal_partition_type(fields[key].type) is not None):
                 if str(requested) not in (value, split.raw_partition[key]):
                     break
                 residual[key] = requested

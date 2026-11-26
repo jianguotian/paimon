@@ -204,24 +204,37 @@ def _legacy_time_directory(value):
     return isinstance(value, str) and re.fullmatch(r"\d\d:\d\d:\d\d(?:\.\d{6})?", value) is not None
 
 
+def _literal_partition_type(typ):
+    types = pyarrow.types
+    if types.is_dictionary(typ):
+        typ = typ.value_type
+    if types.is_string(typ) or types.is_large_string(typ):
+        return pyarrow.large_string()
+    if types.is_binary(typ) or types.is_large_binary(typ) or types.is_fixed_size_binary(typ):
+        return pyarrow.large_binary()
+    return None
+
+
 def _partition_column(tbl, indices, field, split, default):
     value = split.partition[field.name]
     scalar = _partition_scalar(value, field, default)
-    if len(indices) == 1 and scalar.is_valid:
+    if len(indices) == 1:
         import pyarrow.compute as pc
         physical = tbl.column(indices[0])
-        if physical.type == field.type == pyarrow.time64("ns") and _legacy_time_directory(value):
+        if scalar.is_valid and physical.type == field.type == pyarrow.time64("ns") and _legacy_time_directory(value):
             # Restore only the remainder when the physical time belongs to this microsecond.
             actual = physical.cast(pyarrow.time64("us"), safe=False)
             matches = pc.equal(actual, scalar.cast(pyarrow.time64("us")))
             return pc.if_else(pc.fill_null(matches, False), physical, scalar)
         raw = (split.raw_partition or {}).get(field.name)
-        if raw is not None and (pyarrow.types.is_string(field.type) or pyarrow.types.is_binary(field.type)):
+        if raw is not None:
             # A legacy writer could put the literal string "a%2Fb" in that directory.
             # The physical field distinguishes it from a Hive-escaped "a/b".
-            if physical.type == field.type:
-                matches = pc.equal(physical, _partition_scalar(raw, field, default))
-                return pc.if_else(pc.fill_null(matches, False), physical, scalar)
+            common = _literal_partition_type(field.type)
+            if common is not None and common == _literal_partition_type(physical.type):
+                literal = _partition_scalar(raw, field, default)
+                matches = pc.equal(physical.cast(common), literal.cast(common))
+                return pc.if_else(pc.fill_null(matches, False), literal, scalar)
     return pyarrow.repeat(scalar, tbl.num_rows)
 
 
