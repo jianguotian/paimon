@@ -657,8 +657,9 @@ def is_variant_struct(pa_type: pyarrow.StructType) -> bool:
 class PyarrowFieldParser:
 
     @staticmethod
-    def from_paimon_type(data_type: DataType) -> pyarrow.DataType:
+    def from_paimon_type(data_type: DataType, child_type=None) -> pyarrow.DataType:
         # Based on Paimon DataTypes Doc: https://paimon.apache.org/docs/master/concepts/data-types/
+        child_type = child_type or PyarrowFieldParser.from_paimon_type
         if isinstance(data_type, AtomicType):
             type_name = data_type.type.upper()
             if type_name == 'TINYINT':
@@ -686,17 +687,9 @@ class PyarrowFieldParser:
                     pyarrow.field('value', pyarrow.binary(), nullable=False),
                     pyarrow.field('metadata', pyarrow.binary(), nullable=False),
                 ])
-            elif type_name.startswith('DECIMAL'):
-                if type_name == 'DECIMAL':
-                    return pyarrow.decimal128(10, 0)  # default to 10, 0
-                match_ps = re.fullmatch(r'DECIMAL\((\d+),\s*(\d+)\)', type_name)
-                if match_ps:
-                    precision, scale = map(int, match_ps.groups())
-                    return pyarrow.decimal128(precision, scale)
-                match_p = re.fullmatch(r'DECIMAL\((\d+)\)', type_name)
-                if match_p:
-                    precision = int(match_p.group(1))
-                    return pyarrow.decimal128(precision, 0)
+            elif type_name.partition('(')[0] in ('DECIMAL', 'NUMERIC', 'DEC'):
+                from pypaimon.data.decimal import Decimal
+                return pyarrow.decimal128(*Decimal.extract_decimal_precision_scale(type_name))
             if type_name.startswith('TIMESTAMP'):
                 is_ltz = type_name.startswith('TIMESTAMP_LTZ') or 'WITH LOCAL TIME ZONE' in type_name
                 tz = 'UTC' if is_ltz else None
@@ -719,7 +712,7 @@ class PyarrowFieldParser:
             if type_name.startswith('TIME'):
                 return pyarrow.time32('ms')
         elif isinstance(data_type, ArrayType):
-            element_type = PyarrowFieldParser.from_paimon_type(data_type.element)
+            element_type = child_type(data_type.element)
             return pyarrow.list_(
                 pyarrow.field(
                     "item",
@@ -728,10 +721,10 @@ class PyarrowFieldParser:
                 )
             )
         elif isinstance(data_type, VectorType):
-            return pyarrow.list_(PyarrowFieldParser.from_paimon_type(data_type.element), data_type.length)
+            return pyarrow.list_(child_type(data_type.element), data_type.length)
         elif isinstance(data_type, MapType):
-            key_type = PyarrowFieldParser.from_paimon_type(data_type.key)
-            value_type = PyarrowFieldParser.from_paimon_type(data_type.value)
+            key_type = child_type(data_type.key)
+            value_type = child_type(data_type.value)
             return pyarrow.map_(
                 pyarrow.field("key", key_type, nullable=False),
                 pyarrow.field(
@@ -743,14 +736,15 @@ class PyarrowFieldParser:
         elif isinstance(data_type, RowType):
             pa_fields = []
             for field in data_type.fields:
-                pa_field_type = PyarrowFieldParser.from_paimon_type(field.type)
+                pa_field_type = child_type(field.type)
                 pa_fields.append(pyarrow.field(field.name, pa_field_type, nullable=field.type.nullable))
             return pyarrow.struct(pa_fields)
         raise ValueError("Unsupported data type: {}".format(data_type))
 
     @staticmethod
-    def from_paimon_field(data_field: DataField) -> pyarrow.Field:
-        pa_field_type = PyarrowFieldParser.from_paimon_type(data_field.type)
+    def from_paimon_field(data_field: DataField, convert_type=None) -> pyarrow.Field:
+        convert_type = convert_type or PyarrowFieldParser.from_paimon_type
+        pa_field_type = convert_type(data_field.type)
         metadata = {}
         if data_field.description:
             metadata[b'description'] = data_field.description.encode('utf-8')

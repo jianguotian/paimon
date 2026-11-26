@@ -26,6 +26,10 @@ class FormatDataSplit:
     file_path: str
     file_size: int
     partition: Optional[Dict[str, Any]] = None  # partition column name -> value
+    # Older writers used literal percent signs and grouped TIME(ns) by microsecond.
+    # A directory may need its physical partition column to resolve an equality filter.
+    raw_partition: Optional[Dict[str, str]] = None
+    partition_filter: Optional[Dict[str, Any]] = None
 
     def data_path(self) -> str:
         return self.file_path

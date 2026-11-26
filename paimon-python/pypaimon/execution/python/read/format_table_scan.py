@@ -15,13 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import re
+from dataclasses import replace
 from typing import Dict, List, Optional
+from urllib.parse import unquote
 
 import pyarrow.fs as pafs
 
 from pypaimon.common.file_io import FileIO
 from pypaimon.read.plan import Plan
 from pypaimon.table.format.format_data_split import FormatDataSplit
+from pypaimon.table.format.format_table import Format
 
 
 def _is_data_file_name(name: str) -> bool:
@@ -45,6 +49,7 @@ def _list_data_files_recursive(
     path: str,
     partition_keys: List[str],
     partition_only_value: bool,
+    decode_partitions: bool,
     rel_path_parts: Optional[List[str]] = None,
 ) -> List[FormatDataSplit]:
     splits: List[FormatDataSplit] = []
@@ -75,12 +80,14 @@ def _list_data_files_recursive(
                     full_path,
                     partition_keys,
                     partition_only_value,
+                    decode_partitions,
                     child_parts,
                 )
                 splits.extend(sub_splits)
         elif info.type == pafs.FileType.File and _is_data_file_name(name):
             size = getattr(info, "size", None) or 0
             part_spec: Optional[Dict[str, str]] = None
+            raw = {}
             if partition_keys and len(rel_path_parts) >= len(partition_keys):
                 part_spec = dict(
                     zip(
@@ -88,14 +95,67 @@ def _list_data_files_recursive(
                         rel_path_parts[: len(partition_keys)],
                     )
                 )
+                if decode_partitions:
+                    for key, value in part_spec.items():
+                        # Hive escapes individual characters, not UTF-8 byte sequences.
+                        decoded = unquote(value, encoding="latin-1")
+                        if decoded != value:
+                            raw[key] = value
+                            part_spec[key] = decoded
             splits.append(
                 FormatDataSplit(
                     file_path=full_path,
                     file_size=size,
                     partition=part_spec,
+                    raw_partition=raw or None,
                 )
             )
     return splits
+
+
+def _clock_with_nanoseconds(value):
+    match = re.fullmatch(r"(\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?", str(value))
+    if match:
+        return match.group(1) + "." + (match.group(2) or "").ljust(9, "0")
+    return None
+
+
+def _filter_splits(table, splits, partition_filter):
+    import pyarrow as pa
+    from pypaimon.execution.python.read.format_table_read import (
+        _columnar_read_schema, _legacy_time_directory, _literal_partition_type)
+
+    keys = [key for key in partition_filter if key in table.partition_keys]
+    if len(keys) != len(partition_filter):
+        return
+    fields = {f.name: f for f in (_columnar_read_schema(table, keys) or [])}
+    default = table.options().get("partition.default-name", "__DEFAULT_PARTITION__")
+    ns_filters = {k: _clock_with_nanoseconds(v) for k, v in partition_filter.items()
+                  if k in fields and fields[k].type == pa.time64("ns") and v != default}
+
+    for split in splits:
+        if not split.partition:
+            continue
+        residual = {}
+        for key, requested in partition_filter.items():
+            value = split.partition[key]
+            if ns_filters.get(key) is not None and value != default:
+                clock = _clock_with_nanoseconds(value)
+                if _legacy_time_directory(value):
+                    if clock[:-3] != ns_filters[key][:-3]:
+                        break
+                    residual[key] = requested
+                elif clock != ns_filters[key]:
+                    break
+            elif (split.raw_partition and key in split.raw_partition and key in fields
+                  and _literal_partition_type(fields[key].type) is not None):
+                if str(requested) not in (value, split.raw_partition[key]):
+                    break
+                residual[key] = requested
+            elif str(value) != str(requested):
+                break
+        else:
+            yield replace(split, partition_filter=residual) if residual else split
 
 
 def plan(self) -> Plan:
@@ -107,15 +167,8 @@ def plan(self) -> Plan:
         self.table.location(),
         self.table.partition_keys,
         partition_only_value,
+        self.table.format() in (Format.PARQUET, Format.ORC),
     )
     if self.partition_filter:
-        filtered = []
-        for s in splits:
-            match = s.partition and all(
-                str(s.partition.get(k)) == str(v)
-                for k, v in self.partition_filter.items()
-            )
-            if match:
-                filtered.append(s)
-        splits = filtered
+        splits = list(_filter_splits(self.table, splits, self.partition_filter))
     return Plan(_splits=splits)

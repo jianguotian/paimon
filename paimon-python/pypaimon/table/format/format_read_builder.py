@@ -21,7 +21,7 @@ from pypaimon.common.predicate import Predicate
 from pypaimon.common.predicate_builder import PredicateBuilder
 from pypaimon.read.push_down_utils import extract_partition_spec_from_predicate
 from pypaimon.schema.data_types import DataField
-from pypaimon.table.format.format_table import FormatTable
+from pypaimon.table.format.format_table import Format, FormatTable
 from pypaimon.table.format.format_table_scan import FormatTableScan
 from pypaimon.table.format.format_table_read import FormatTableRead
 
@@ -78,6 +78,8 @@ class FormatReadBuilder:
         return PredicateBuilder(self.read_type())
 
     def read_type(self) -> List[DataField]:
+        if self.table.format() in (Format.ORC, Format.PARQUET):
+            return self.table.projected_fields(self._projection)
         if self._projection:
             return [f for f in self.table.fields if f.name in self._projection]
         return list(self.table.fields)
