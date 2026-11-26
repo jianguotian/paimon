@@ -229,6 +229,53 @@ class RESTFormatTableTest(RESTBaseTest):
         self._write_arrow(table, pa.table({"v": pa.array(rows, type=physical)}))
         self._assert_format_read(table, pa.table({"v": GenericVariant.to_arrow_array([value, None])}))
 
+    def test_parquet_binary_and_time_partition_round_trip(self):
+        name = "default.typed_partitions"
+        schema = pa.schema([("id", pa.int64()), ("key", pa.binary()), ("clock", pa.time64("us"))])
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            schema, partition_keys=["key", "clock"], options={"type": "format-table", "file.format": "parquet"}), False)
+        table = self.rest_catalog.get_table(name)
+        data = pa.table({"id": [1], "key": [b"\xff'"], "clock": [1234567]}, schema=schema)
+        self._write_arrow(table, data)
+        expected = data.set_column(2, "clock", data.column("clock").cast(pa.time64("ns")))
+        self._assert_format_read(table, expected)
+
+    def test_parquet_default_partition(self):
+        import pyarrow.parquet as pq
+        name = "default.null_partition"
+        schema = pa.schema([("id", pa.int64()), ("pt", pa.int64())])
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            schema, partition_keys=["pt"], options={"type": "format-table", "file.format": "parquet",
+                                                    "partition.default-name": "__HIVE_DEFAULT_PARTITION__"}), False)
+        table = self.rest_catalog.get_table(name)
+        directory = table.location() + "/pt=__HIVE_DEFAULT_PARTITION__"
+        table.file_io.check_or_mkdirs(directory)
+        with table.file_io.new_output_stream(directory + "/part.parquet") as stream:
+            pq.write_table(pa.table({"id": [1], "pt": [23]}), stream)
+        self._assert_format_read(table, pa.table({"id": [1], "pt": [None]}, schema=schema))
+
+    @parameterized.expand([("parquet",), ("orc",)])
+    def test_millisecond_directory_partitions(self, file_format):
+        if file_format == "orc":
+            pytest.importorskip("pyarrow.orc")
+        name = "default.partition_millis"
+        fields = [DataField(0, "ts", AtomicType("TIMESTAMP(3)")), DataField(1, "t", AtomicType("TIME(3)"))]
+        self.rest_catalog.create_table(name, Schema(
+            fields=fields, partition_keys=["ts", "t"], options={"type": "format-table", "file.format": file_format}),
+            False)
+        table = self.rest_catalog.get_table(name)
+        expected = pa.table({"ts": pa.array([1001], pa.timestamp("ms")), "t": pa.array([1001], pa.time32("ms"))})
+        if file_format == "parquet":
+            self._write_arrow(table, expected)
+        else:
+            # ORC represents TIME as an integer and external writers may omit directory keys.
+            import pyarrow.orc as orc
+            directory = table.location() + "/ts=1970-01-01 00:00:01.001000/t=00:00:01.001000"
+            table.file_io.check_or_mkdirs(directory)
+            with table.file_io.new_output_stream(directory + "/part.orc") as stream:
+                orc.write_table(pa.table({"other": [1]}), stream)
+        self._assert_format_read(table, expected)
+
     @parameterized.expand([("parquet",), ("orc",)])
     def test_columnar_case_sensitive_catalog(self, file_format):
         if file_format == "orc":

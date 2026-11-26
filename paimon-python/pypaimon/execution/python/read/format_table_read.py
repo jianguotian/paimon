@@ -48,11 +48,11 @@ def _columnar_read_schema(
     if fmt not in (Format.PARQUET, Format.ORC):
         return None
 
-    def read_type(data_type):
+    def read_type(data_type, partition=False):
         if isinstance(data_type, MultisetType):
             return pyarrow.map_(read_type(data_type.element), pyarrow.field("value", pyarrow.int32(), nullable=False))
         typ = PyarrowFieldParser.from_paimon_type(data_type, child_type=read_type)
-        if fmt == Format.ORC and pyarrow.types.is_timestamp(typ):
+        if fmt == Format.ORC and not partition and pyarrow.types.is_timestamp(typ):
             return pyarrow.timestamp("ns", tz=typ.tz)
         if fmt == Format.PARQUET and pyarrow.types.is_time(typ):
             # Python catalog schemas historically recorded every Arrow time unit as TIME(0).
@@ -65,9 +65,9 @@ def _columnar_read_schema(
                 return pyarrow.time64("us")
         return typ
 
-    # Directory partition values use the catalog type regardless of the file encoding.
+    # ORC timestamps from files use ns; directory timestamps retain the catalog range.
     return pyarrow.schema([
-        PyarrowFieldParser.from_paimon_field(field, None if field.name in table.partition_keys else read_type)
+        PyarrowFieldParser.from_paimon_field(field, lambda typ: read_type(typ, field.name in table.partition_keys))
         for field in table.projected_fields(projection)
     ])
 
@@ -164,10 +164,25 @@ def _orc_positional_levels(table, file_names, path):
     return int(options.get("orc.force.positional.evolution.level", 1))
 
 
-def _partition_scalar(value, field):
-    if value is None:
+def _partition_scalar(value, field, default_partition):
+    if value is None or value == default_partition:
         return pyarrow.scalar(None, type=field.type)
     text = str(value)
+    if pyarrow.types.is_time(field.type) or pyarrow.types.is_timestamp(field.type):
+        # datetime/time stringify milliseconds with six fractional digits. Arrow
+        # accepts only the target precision, even when the extra digits are zero.
+        text = re.sub(r"\.\d+", lambda match: match.group().rstrip("0").rstrip("."), text, count=1)
+    if pyarrow.types.is_binary(field.type) or pyarrow.types.is_large_binary(field.type):
+        # The Python writer uses str(bytes) as the directory component. External
+        # writers can supply plain UTF-8 instead.
+        if text.startswith(("b'", 'b"')):
+            import ast
+            try:
+                binary = ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                binary = None
+            if isinstance(binary, bytes) and repr(binary) == text:
+                return pyarrow.scalar(binary, type=field.type)
     if pyarrow.types.is_time(field.type):
         # Arrow parses ISO timestamps, but has no string-to-time cast kernel.
         return pyarrow.scalar("1970-01-01T" + text).cast(pyarrow.timestamp(field.type.unit)).cast(field.type)
@@ -246,11 +261,13 @@ def _align_columnar_table(tbl, schema, table, split):
     column_names = {}
     logical_types = {field.name: field.type for field in table.fields}
     partition = split.partition or {}
+    default_partition = table.options().get("partition.default-name", "__DEFAULT_PARTITION__")
     for field in schema:
         key = name_key(field.name)
         if field.name in partition:
             # Scan pruning and returned partition values must use the same directory.
-            column = pyarrow.repeat(_partition_scalar(partition[field.name], field), tbl.num_rows)
+            scalar = _partition_scalar(partition[field.name], field, default_partition)
+            column = pyarrow.repeat(scalar, tbl.num_rows)
             indices = file_names.get_all_field_indices(key)
             if len(indices) == 1 and tbl.schema.field(indices[0]).type == field.type:
                 column_names[tbl.schema.field(indices[0]).name] = field.name
