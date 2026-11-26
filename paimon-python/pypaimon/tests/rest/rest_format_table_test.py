@@ -240,6 +240,68 @@ class RESTFormatTableTest(RESTBaseTest):
         expected = data.set_column(2, "clock", data.column("clock").cast(pa.time64("ns")))
         self._assert_format_read(table, expected)
 
+    @parameterized.expand([("parquet", "false"), ("orc", "true")])
+    def test_escaped_directory_partition_filter(self, file_format, only_value):
+        from pypaimon.filesystem.local_file_io import LocalFileIO
+        if file_format == "orc":
+            codec = pytest.importorskip("pyarrow.orc")
+        else:
+            import pyarrow.parquet as codec
+        name = "default.escaped_partitions"
+        schema = pa.schema([("id", pa.int64()), ("pt", pa.string())])
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            schema, partition_keys=["pt"], options={"type": "format-table", "file.format": file_format,
+                                                    "format-table.partition-path-only-value": only_value}), False)
+        table = self.rest_catalog.get_table(name)
+        root = LocalFileIO._to_file(table.location())
+        for i, (component, value) in enumerate([("a%2Fb", "a/b"), ("a%252Fb", "a%2Fb")]):
+            directory = root / (component if only_value == "true" else "pt=" + component)
+            directory.mkdir()
+            codec.write_table(pa.table({"id": [i], "pt": [value]}), str(directory / ("external." + file_format)))
+        # A Python file written in the same physical directory can contain a literal percent escape.
+        codec.write_table(pa.table({"id": [2], "pt": ["a%2Fb"]}),
+                          str(root / ("a%2Fb" if only_value == "true" else "pt=a%2Fb") / ("literal." + file_format)))
+        for value, ids in [("a/b", [0]), ("a%2Fb", [1, 2])]:
+            builder = table.new_read_builder().with_partition_filter({"pt": value})
+            splits = builder.new_scan().plan().splits()
+            self.assertIn(value, [split.partition["pt"] for split in splits])
+            reader = builder.new_read()
+            self.assertEqual(sorted(reader.to_arrow(splits).column("id").to_pylist()), ids)
+            self.assertEqual([row.column(1)[0].as_py() for row in reader.to_iterator(splits)], [value] * len(ids))
+
+    def test_parquet_nanosecond_partition_legacy_and_new_files(self):
+        import pyarrow.parquet as pq
+        name = "default.nanos_partition"
+        schema = pa.schema([("id", pa.int64()), ("clock", pa.time64("ns"))])
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            schema, partition_keys=["clock"], options={"type": "format-table", "file.format": "parquet"}), False)
+        table = self.rest_catalog.get_table(name)
+        ticks = [1001001, 1001999]
+        data = pa.table({"id": [1, 2], "clock": ticks}, schema=schema)
+        directory = table.location() + "/clock=00:00:00.001001"
+        table.file_io.check_or_mkdirs(directory)
+        with table.file_io.new_output_stream(directory + "/legacy.parquet") as stream:
+            # A genuinely conflicting physical key must still resolve to the directory.
+            pq.write_table(pa.table({"id": [1, 2, 4], "clock": ticks + [2001999]}, schema=schema), stream)
+        builder = table.new_read_builder()
+        legacy, = builder.new_scan().plan().splits()
+        reader = builder.new_read()
+        expected = ticks + [1001000]
+        self.assertEqual(reader.to_arrow([legacy]).column("clock").cast(pa.int64()).to_pylist(), expected)
+        self.assertEqual([row.column(1)[0].cast(pa.int64()).as_py() for row in reader.to_iterator([legacy])], expected)
+        self._write_arrow(table, data)
+        # External writers may use a full-precision directory with no physical partition field.
+        exact = table.location() + "/clock=00:00:00.001001001"
+        table.file_io.check_or_mkdirs(exact)
+        with table.file_io.new_output_stream(exact + "/external.parquet") as stream:
+            pq.write_table(pa.table({"id": [3]}), stream)
+        for value, ids in [("00:00:00.001001001", [1, 1, 3]), ("00:00:00.001001999", [2, 2]),
+                           ("00:00:00.001001", [4]), ("00:00:00.001002", [])]:
+            scan = table.new_read_builder().with_partition_filter({"clock": value}).new_scan()
+            selected = scan.plan().splits()
+            projected = table.new_read_builder().with_projection(["id"]).new_read()
+            self.assertEqual(sorted(projected.to_arrow(selected).column("id").to_pylist()), ids)
+
     def test_parquet_default_partition(self):
         import pyarrow.parquet as pq
         name = "default.null_partition"

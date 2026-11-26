@@ -199,6 +199,32 @@ def _partition_scalar(value, field, default_partition):
     return scalar
 
 
+def _legacy_time_directory(value):
+    # str(datetime.time) emits either no fraction or exactly six digits.
+    return isinstance(value, str) and re.fullmatch(r"\d\d:\d\d:\d\d(?:\.\d{6})?", value) is not None
+
+
+def _partition_column(tbl, indices, field, split, default):
+    value = split.partition[field.name]
+    scalar = _partition_scalar(value, field, default)
+    if len(indices) == 1 and scalar.is_valid:
+        import pyarrow.compute as pc
+        physical = tbl.column(indices[0])
+        if physical.type == field.type == pyarrow.time64("ns") and _legacy_time_directory(value):
+            # Restore only the remainder when the physical time belongs to this microsecond.
+            actual = physical.cast(pyarrow.time64("us"), safe=False)
+            matches = pc.equal(actual, scalar.cast(pyarrow.time64("us")))
+            return pc.if_else(pc.fill_null(matches, False), physical, scalar)
+        raw = (split.raw_partition or {}).get(field.name)
+        if raw is not None and (pyarrow.types.is_string(field.type) or pyarrow.types.is_binary(field.type)):
+            # A legacy writer could put the literal string "a%2Fb" in that directory.
+            # The physical field distinguishes it from a Hive-escaped "a/b".
+            if physical.type == field.type:
+                matches = pc.equal(physical, _partition_scalar(raw, field, default))
+                return pc.if_else(pc.fill_null(matches, False), physical, scalar)
+    return pyarrow.repeat(scalar, tbl.num_rows)
+
+
 def _project_metadata(file_schema, column_names):
     metadata = file_schema.metadata
     if not metadata or b"pandas" not in metadata:
@@ -262,13 +288,22 @@ def _align_columnar_table(tbl, schema, table, split):
     logical_types = {field.name: field.type for field in table.fields}
     partition = split.partition or {}
     default_partition = table.options().get("partition.default-name", "__DEFAULT_PARTITION__")
+    if split.partition_filter:
+        import pyarrow.compute as pc
+        for field in _columnar_read_schema(table, list(split.partition_filter)):
+            indices = file_names.get_all_field_indices(name_key(field.name))
+            column = _partition_column(tbl, indices, field, split, default_partition)
+            requested = _partition_scalar(split.partition_filter[field.name], field, default_partition)
+            mask = pc.equal(column, requested) if requested.is_valid else column.is_null()
+            tbl = tbl.filter(mask)
+            if not tbl.num_rows:
+                return schema.empty_table()
     for field in schema:
         key = name_key(field.name)
         if field.name in partition:
             # Scan pruning and returned partition values must use the same directory.
-            scalar = _partition_scalar(partition[field.name], field, default_partition)
-            column = pyarrow.repeat(scalar, tbl.num_rows)
             indices = file_names.get_all_field_indices(key)
+            column = _partition_column(tbl, indices, field, split, default_partition)
             if len(indices) == 1 and tbl.schema.field(indices[0]).type == field.type:
                 column_names[tbl.schema.field(indices[0]).name] = field.name
         else:
