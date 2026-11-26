@@ -16,6 +16,7 @@
 # under the License.
 
 import unittest
+from decimal import Decimal
 from unittest.mock import patch
 
 import pandas as pd
@@ -156,6 +157,77 @@ class RESTFormatTableTest(RESTBaseTest):
             with patch.object(file_io, "new_input_stream", wraps=file_io.new_input_stream) as opened:
                 self.assertEqual(read(ordered).to_pydict(), {"created": [None], "campaign": [None]})
                 opened.assert_called_once_with(old_split.data_path())
+
+    def test_parquet_evolved_nullable_integer_pandas_dtype(self):
+        name = "default.pandas_integer"
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            pa.schema([("id", pa.int64())]), options={"type": "format-table", "file.format": "parquet"}), False)
+        self._write_arrow(self.rest_catalog.get_table(name), pa.table({"id": [0]}))
+        old, = self.rest_catalog.get_table(name).new_read_builder().new_scan().plan().splits()
+        self.rest_catalog.alter_table(name, [SchemaChange.add_column("amount", AtomicType("BIGINT"))])
+        table = self.rest_catalog.get_table(name)
+        builder = table.new_batch_write_builder()
+        writer, commit = builder.new_write(), builder.new_commit()
+        large = 2 ** 53 + 1
+        try:
+            writer.write_pandas(pd.DataFrame({"id": [1, 2], "amount": pd.array([large, None], dtype="Int64")}))
+            commit.commit(writer.prepare_commit())
+        finally:
+            writer.close()
+            commit.close()
+        read = table.new_read_builder().with_projection(["amount"])
+        new, = [s for s in read.new_scan().plan().splits() if s != old]
+        for splits, values in (([new], [large, None]), ([old, new], [None, large, None]),
+                               ([new, old], [large, None, None])):
+            expected = pd.DataFrame({"amount": pd.array(values, dtype="Int64")})
+            pd.testing.assert_frame_equal(read.new_read().to_pandas(splits), expected)
+
+    @parameterized.expand([("parquet",), ("orc",)])
+    def test_directory_partition_overrides_physical_column(self, file_format):
+        if file_format == "orc":
+            codec = pytest.importorskip("pyarrow.orc")
+        else:
+            import pyarrow.parquet as codec
+        name = "default.partition_source"
+        self.rest_catalog.create_table(name, Schema.from_pyarrow_schema(
+            pa.schema([("id", pa.int64()), ("pt", pa.string())]), partition_keys=["pt"],
+            options={"type": "format-table", "file.format": file_format}), False)
+        table = CatalogFactory.create({**self.options, "case-sensitive": "false"}).get_table(name)
+        directory = table.location() + "/pt=west"
+        table.file_io.check_or_mkdirs(directory)
+        with table.file_io.new_output_stream(directory + "/part." + file_format) as stream:
+            codec.write_table(pa.table({"id": [1], "PT": ["east"]}), stream)
+        builder = table.new_read_builder().with_partition_filter({"pt": "west"}).with_projection(["pt"])
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read()
+        self.assertEqual(reader.to_arrow(splits).to_pydict(), {"pt": ["west"]})
+        self.assertEqual(next(reader.to_iterator(splits)).to_pydict(), {"pt": ["west"]})
+
+    @parameterized.expand([("parquet", "NUMERIC"), ("orc", "DEC")])
+    def test_columnar_decimal_alias(self, file_format, alias):
+        if file_format == "orc":
+            pytest.importorskip("pyarrow.orc")
+        name = "default.decimal_alias"
+        self.rest_catalog.create_table(name, Schema(
+            fields=[DataField(0, "amount", AtomicType(alias + "(10, 2)"))],
+            options={"type": "format-table", "file.format": file_format}), False)
+        table = self.rest_catalog.get_table(name)
+        expected = pa.table({"amount": pa.array([Decimal("1.23")], pa.decimal128(10, 2))})
+        self._write_arrow(table, expected)
+        self._assert_format_read(table, expected)
+
+    def test_parquet_shredded_variant(self):
+        from pypaimon.data.generic_variant import GenericVariant
+        name = "default.variant_table"
+        self.rest_catalog.create_table(name, Schema(
+            fields=[DataField(0, "v", AtomicType("VARIANT"))],
+            options={"type": "format-table", "file.format": "parquet"}), False)
+        table = self.rest_catalog.get_table(name)
+        physical = pa.struct([("metadata", pa.binary()), ("value", pa.binary()), ("typed_value", pa.bool_())])
+        value = GenericVariant.from_python(True)
+        rows = [{"metadata": value.metadata(), "typed_value": True}, None]
+        self._write_arrow(table, pa.table({"v": pa.array(rows, type=physical)}))
+        self._assert_format_read(table, pa.table({"v": GenericVariant.to_arrow_array([value, None])}))
 
     @parameterized.expand([("parquet",), ("orc",)])
     def test_columnar_case_sensitive_catalog(self, file_format):

@@ -15,13 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
 import re
 from typing import Any, Dict, Iterator, List, Optional
 
 import pyarrow
 
 from pypaimon.common.options.options_utils import OptionsUtils
-from pypaimon.schema.data_types import MultisetType, PyarrowFieldParser
+from pypaimon.schema.data_types import AtomicType, MapType, MultisetType, PyarrowFieldParser, RowType
 from pypaimon.table.format.format_data_split import FormatDataSplit
 from pypaimon.table.format.format_table import FormatTable, Format
 
@@ -78,17 +79,22 @@ def _field_index(fields, name, path):
     return indices[0] if indices else None
 
 
-def _align_array(array, target, name_key, positional_levels, fmt, path):
+def _align_array(array, target, logical_type, name_key, positional_levels, fmt, path):
     """Resolve nested fields explicitly; older Arrow casts cannot reorder struct children."""
     source = array.type
     if source == target:
         return array
 
-    def child(values, child_type):
-        return _align_array(values, child_type, name_key, positional_levels - 1, fmt, path)
+    def child(values, child_type, logical_child):
+        return _align_array(values, child_type, logical_child, name_key, positional_levels - 1, fmt, path)
 
     types = pyarrow.types
     if types.is_struct(source) and types.is_struct(target):
+        if isinstance(logical_type, AtomicType) and logical_type.type.upper() == "VARIANT":
+            from pypaimon.data.variant_shredding import build_variant_schema
+            from pypaimon.execution.python.read.variant_shredding import assemble_shredded_column
+            if source.get_field_index("typed_value") >= 0 and source.get_field_index("metadata") >= 0:
+                return assemble_shredded_column(array, build_variant_schema(source))
         names = pyarrow.schema([field.with_name(name_key(field.name)) for field in source])
         source_children = array.flatten()
         children = []
@@ -99,7 +105,8 @@ def _align_array(array, target, name_key, positional_levels, fmt, path):
                     raise ValueError(f"Missing required column {field.name!r} in {path}")
                 values = pyarrow.nulls(len(array), field.type)
             else:
-                values = child(source_children[index], field.type)
+                logical_child = logical_type.fields[i].type if isinstance(logical_type, RowType) else None
+                values = child(source_children[index], field.type, logical_child)
                 if not field.nullable and values.null_count:
                     import pyarrow.compute as pc
                     if pc.any(pc.and_(array.is_valid(), values.is_null())).as_py():
@@ -108,8 +115,9 @@ def _align_array(array, target, name_key, positional_levels, fmt, path):
         return pyarrow.StructArray.from_arrays(children, fields=list(target), mask=array.is_null())
 
     if types.is_map(source) and types.is_map(target):
-        keys = child(array.keys, target.key_type)
-        items = child(array.items, target.item_type)
+        keys = child(array.keys, target.key_type,
+                     logical_type.key if isinstance(logical_type, MapType) else logical_type.element)
+        items = child(array.items, target.item_type, logical_type.value if isinstance(logical_type, MapType) else None)
         if not target.item_field.nullable and items.null_count:
             entries = array.view(pyarrow.list_(source.field(0))).flatten()
             if entries.field(1).null_count:
@@ -120,7 +128,7 @@ def _align_array(array, target, name_key, positional_levels, fmt, path):
 
     list_types = (pyarrow.ListType, pyarrow.LargeListType, pyarrow.FixedSizeListType)
     if isinstance(source, list_types) and isinstance(target, list_types):
-        values = child(array.values, target.value_type)
+        values = child(array.values, target.value_type, logical_type.element)
         if not target.value_field.nullable and values.null_count and array.flatten().null_count:
             raise ValueError(f"Null in required list element in {path}")
         if types.is_large_list(source):
@@ -156,6 +164,69 @@ def _orc_positional_levels(table, file_names, path):
     return int(options.get("orc.force.positional.evolution.level", 1))
 
 
+def _partition_scalar(value, field):
+    if value is None:
+        return pyarrow.scalar(None, type=field.type)
+    text = str(value)
+    if pyarrow.types.is_time(field.type):
+        # Arrow parses ISO timestamps, but has no string-to-time cast kernel.
+        return pyarrow.scalar("1970-01-01T" + text).cast(pyarrow.timestamp(field.type.unit)).cast(field.type)
+    scalar = pyarrow.scalar(text).cast(field.type)
+    if pyarrow.types.is_timestamp(field.type) and field.type.unit == "ns":
+        # Arrow's direct string-to-ns cast can silently wrap outside the int64 range.
+        from pandas import Timestamp
+        try:
+            ticks = Timestamp(text).value
+        except (ValueError, OverflowError) as error:
+            raise ValueError(f"Invalid timestamp partition {field.name}={text!r}") from error
+        if ticks != scalar.cast(pyarrow.int64()).as_py():
+            raise ValueError(f"Invalid timestamp partition {field.name}={text!r}")
+    return scalar
+
+
+def _project_metadata(file_schema, column_names):
+    metadata = file_schema.metadata
+    if not metadata or b"pandas" not in metadata:
+        return metadata
+    pandas = file_schema.pandas_metadata
+    columns = []
+    for entry in pandas["columns"]:
+        name = entry.get("field_name", entry["name"])
+        if name in column_names:
+            projected = column_names[name]
+            columns.append(entry if name == projected else dict(entry, field_name=projected, name=projected))
+    pandas["columns"] = columns
+    pandas["index_columns"] = [column_names.get(idx, idx) if isinstance(idx, str) else idx
+                               for idx in pandas["index_columns"] if not isinstance(idx, str) or idx in column_names]
+    return {**metadata, b"pandas": json.dumps(pandas).encode()}
+
+
+def _concat_columnar_tables(tables):
+    out = pyarrow.concat_tables(tables)
+    if len(tables) == 1:
+        return out
+    # concat_tables takes metadata only from the first file. An evolved column's
+    # nullable Pandas dtype may first appear in a later file.
+    pandas = None
+    columns = {}
+    for table in tables:
+        meta = table.schema.pandas_metadata
+        if meta is None:
+            continue
+        if pandas is None:
+            pandas = meta
+        for entry in meta["columns"]:
+            name = entry.get("field_name", entry["name"])
+            if name not in columns or entry["numpy_type"] in ("Int64", "UInt64"):
+                columns[name] = entry
+    if pandas is not None:
+        pandas["columns"] = list(columns.values())
+        metadata = dict(out.schema.metadata or {})
+        metadata[b"pandas"] = json.dumps(pandas).encode()
+        out = out.replace_schema_metadata(metadata)
+    return out
+
+
 def _align_columnar_table(tbl, schema, table, split):
     positional_levels = _orc_positional_levels(table, tbl.column_names, split.data_path())
 
@@ -172,41 +243,39 @@ def _align_columnar_table(tbl, schema, table, split):
         positions = dict(zip(data_names, data_indices))
 
     arrays = []
+    column_names = {}
+    logical_types = {field.name: field.type for field in table.fields}
+    partition = split.partition or {}
     for field in schema:
         key = name_key(field.name)
-        if positional_levels > 0 and key not in partition_keys:
-            index = positions.get(field.name)
+        if field.name in partition:
+            # Scan pruning and returned partition values must use the same directory.
+            column = pyarrow.repeat(_partition_scalar(partition[field.name], field), tbl.num_rows)
+            indices = file_names.get_all_field_indices(key)
+            if len(indices) == 1 and tbl.schema.field(indices[0]).type == field.type:
+                column_names[tbl.schema.field(indices[0]).name] = field.name
         else:
-            index = _field_index(file_names, key, split.data_path())
-
-        if index is not None:
-            column = tbl.column(index)
-            if column.type != field.type:
-                chunks = [_align_array(chunk, field.type, name_key, positional_levels - 1,
-                                       table.format(), split.data_path()) for chunk in column.chunks]
-                column = pyarrow.chunked_array(chunks, type=field.type)
-        elif split.partition and field.name in split.partition:
-            value = split.partition[field.name]
-            text = None if value is None else str(value)
-            scalar = pyarrow.scalar(text, type=pyarrow.string()).cast(field.type)
-            if text is not None and pyarrow.types.is_timestamp(field.type) and field.type.unit == "ns":
-                # Arrow's direct string-to-ns cast can silently wrap outside the int64 range.
-                from pandas import Timestamp
-                try:
-                    ticks = Timestamp(text).value
-                except (ValueError, OverflowError) as error:
-                    raise ValueError(f"Invalid timestamp partition {field.name}={text!r}") from error
-                if ticks != scalar.cast(pyarrow.int64()).as_py():
-                    raise ValueError(f"Invalid timestamp partition {field.name}={text!r}")
-            column = pyarrow.repeat(scalar, tbl.num_rows)
-        elif field.nullable:
-            column = pyarrow.nulls(tbl.num_rows, type=field.type)
-        else:
-            raise ValueError(f"Missing required column {field.name!r} in {split.data_path()}")
+            if positional_levels > 0 and key not in partition_keys:
+                index = positions.get(field.name)
+            else:
+                index = _field_index(file_names, key, split.data_path())
+            if index is not None:
+                column = tbl.column(index)
+                if column.type == field.type:
+                    column_names[tbl.schema.field(index).name] = field.name
+                else:
+                    chunks = [_align_array(chunk, field.type, logical_types[field.name], name_key,
+                                           positional_levels - 1, table.format(), split.data_path())
+                              for chunk in column.chunks]
+                    column = pyarrow.chunked_array(chunks, type=field.type)
+            elif field.nullable:
+                column = pyarrow.nulls(tbl.num_rows, type=field.type)
+            else:
+                raise ValueError(f"Missing required column {field.name!r} in {split.data_path()}")
         if not field.nullable and column.null_count:
             raise ValueError(f"Null in required column {field.name!r} in {split.data_path()}")
         arrays.append(column)
-    return pyarrow.Table.from_arrays(arrays, schema=schema)
+    return pyarrow.Table.from_arrays(arrays, schema=schema.with_metadata(_project_metadata(tbl.schema, column_names)))
 
 
 def _read_file_to_arrow(
@@ -391,7 +460,7 @@ def to_arrow(
             {n: [] for n in schema.names},
             schema=schema,
         )
-    out = pyarrow.concat_tables(tables)
+    out = _concat_columnar_tables(tables) if columnar_schema is not None else pyarrow.concat_tables(tables)
     if self.limit is not None and out.num_rows > self.limit:
         out = out.slice(0, self.limit)
     return out

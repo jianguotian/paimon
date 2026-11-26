@@ -687,17 +687,9 @@ class PyarrowFieldParser:
                     pyarrow.field('value', pyarrow.binary(), nullable=False),
                     pyarrow.field('metadata', pyarrow.binary(), nullable=False),
                 ])
-            elif type_name.startswith('DECIMAL'):
-                if type_name == 'DECIMAL':
-                    return pyarrow.decimal128(10, 0)  # default to 10, 0
-                match_ps = re.fullmatch(r'DECIMAL\((\d+),\s*(\d+)\)', type_name)
-                if match_ps:
-                    precision, scale = map(int, match_ps.groups())
-                    return pyarrow.decimal128(precision, scale)
-                match_p = re.fullmatch(r'DECIMAL\((\d+)\)', type_name)
-                if match_p:
-                    precision = int(match_p.group(1))
-                    return pyarrow.decimal128(precision, 0)
+            elif type_name.partition('(')[0] in ('DECIMAL', 'NUMERIC', 'DEC'):
+                from pypaimon.data.decimal import Decimal
+                return pyarrow.decimal128(*Decimal.extract_decimal_precision_scale(type_name))
             if type_name.startswith('TIMESTAMP'):
                 is_ltz = type_name.startswith('TIMESTAMP_LTZ') or 'WITH LOCAL TIME ZONE' in type_name
                 tz = 'UTC' if is_ltz else None
